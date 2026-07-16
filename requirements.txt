@@ -1,0 +1,31 @@
+# API
+fastapi
+
+pydantic-settings
+
+# Database and migrations
+sqlalchemy
+psycopg[binary]
+alembic
+
+# F1 data ingestion and processing
+fastf1
+httpx
+pandas
+numpy
+
+# Cache and real-time replay
+redis
+websockets
+
+# Reliability and structured logs
+tenacity
+structlog
+orjson
+python-dotenv
+
+# Testing and code quality
+pytest
+pytest-asyncio
+pytest-cov
+ruff
