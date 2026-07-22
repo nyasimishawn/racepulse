@@ -2,9 +2,17 @@ from contextlib import asynccontextmanager
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import settings
+from app.core.exceptions import install_exception_handlers
+from app.core.redis import (
+    RedisUnavailableError,
+    create_redis_client,
+    ensure_redis_available,
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,9 +23,26 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    logger.info("%s is starting in %s mode", settings.app_name, settings.environment)
+async def lifespan(app: FastAPI):
+    redis = create_redis_client()
+    app.state.redis = redis
+
+    try:
+        await ensure_redis_available(redis)
+        logger.info("Redis is connected.")
+    except RedisUnavailableError as error:
+        logger.warning("Redis is not ready: %s", error)
+
+    logger.info(
+        "%s is starting in %s mode",
+        settings.app_name,
+        settings.environment,
+    )
+
     yield
+
+    await redis.aclose()
+
     logger.info("%s is shutting down", settings.app_name)
 
 
@@ -32,7 +57,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(api_router, prefix=settings.api_v1_prefix)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=settings.cors_allowed_origin_regex,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+install_exception_handlers(app)
+
+app.include_router(
+    api_router,
+    prefix=settings.api_v1_prefix,
+)
 
 
 @app.get("/", tags=["Root"], summary="Show API information")

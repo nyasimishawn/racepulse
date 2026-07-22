@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     debug: bool = True
     api_v1_prefix: str = "/api/v1"
 
+    cors_allowed_origin_regex: str = (
+        r"^http://(localhost|127\.0\.0\.1):\d+$"
+    )
+
     database_url: str = (
         "postgresql+psycopg://racepulse:racepulse@localhost:5432/racepulse"
     )

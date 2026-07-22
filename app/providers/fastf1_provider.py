@@ -71,6 +71,35 @@ class FastF1Provider(TimingDataProvider):
             drivers=tuple(drivers),
         )
 
+    def load_context_session(
+        self,
+        *,
+        year: int,
+        event_name: str,
+        session_identifier: str,
+    ):
+        try:
+            session = fastf1.get_session(
+                year,
+                event_name,
+                session_identifier,
+            )
+
+            session.load(
+                telemetry=False,
+                laps=True,
+                weather=True,
+                messages=True,
+            )
+
+            return session
+
+        except Exception as error:
+            raise ProviderError(
+                f"FastF1 could not load context data for {event_name} "
+                f"{year} ({session_identifier})."
+            ) from error
+
     def _extract_drivers(self, results: pd.DataFrame) -> list[DriverPreview]:
         drivers: list[DriverPreview] = []
 

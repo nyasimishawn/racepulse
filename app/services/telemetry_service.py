@@ -183,7 +183,11 @@ class TelemetryImportService:
         point.distance_m = self._decimal(row.get("Distance"))
 
         point.sample_source = sample_source
-        point.is_interpolated = sample_source == "interpolated"
+        point.is_interpolated = (
+                sample_source is not None
+                and sample_source.casefold()
+                in {"interpolation", "interpolated"}
+        )
 
     @staticmethod
     def _text(value: object) -> str | None:

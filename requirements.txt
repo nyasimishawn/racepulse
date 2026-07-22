@@ -29,3 +29,5 @@ pytest
 pytest-asyncio
 pytest-cov
 ruff
+
+uvicorn

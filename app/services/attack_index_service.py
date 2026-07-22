@@ -31,6 +31,10 @@ class RaceLapNotFoundError(LookupError):
     pass
 
 
+class NonRaceSessionError(ValueError):
+    pass
+
+
 class AttackIndexService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -62,6 +66,17 @@ class AttackIndexService:
             )
 
         race_lap, driver, race_session = context
+
+        is_race_session = (
+            (race_session.session_identifier or "").strip().upper() == "R"
+            or (race_session.session_type or "").strip().casefold() == "race"
+        )
+
+        if not is_race_session:
+            raise NonRaceSessionError(
+                "Attack Index currently supports Race laps only. "
+                "Select the Race session (R), not Qualifying (Q)."
+            )
 
         reference = QualifyingQueryService(
             self.db
