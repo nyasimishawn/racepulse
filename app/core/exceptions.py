@@ -9,6 +9,8 @@ from fastapi.responses import ORJSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from collections.abc import Mapping
+
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,7 @@ def _error_response(
     code: str,
     message: str,
     details: Any | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> ORJSONResponse:
     return ORJSONResponse(
         status_code=status_code,
@@ -29,6 +32,7 @@ def _error_response(
                 "details": details,
             }
         },
+        headers=headers,
     )
 
 
@@ -55,6 +59,7 @@ async def handle_http_exception(
         code=f"HTTP_{error.status_code}",
         message=message,
         details=details,
+        headers=error.headers,
     )
 
 

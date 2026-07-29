@@ -33,11 +33,11 @@ class TelemetryImportService:
         self.fastf1_provider = FastF1Provider()
 
     def import_lap_telemetry(
-        self,
-        *,
-        race_session_id: UUID,
-        driver_number: str,
-        lap_number: int,
+            self,
+            *,
+            race_session_id: UUID,
+            driver_number: str,
+            lap_number: int,
     ) -> int:
         context = self.db.execute(
             select(Lap, Driver, RaceSession, Meeting)
@@ -67,34 +67,31 @@ class TelemetryImportService:
                 event_name=meeting.name,
                 session_identifier=race_session.session_identifier,
             )
-
-            selected_laps = (
-                fastf1_session.laps
-                .pick_drivers(driver_number)
-                .pick_laps(lap_number)
-            )
-
-            if selected_laps.empty:
-                raise TelemetryUnavailableError(
-                    "FastF1 has no telemetry for this driver lap."
-                )
-
-            telemetry = selected_laps.get_telemetry(
-                frequency="original"
-            )
-
-            if telemetry.empty:
-                raise TelemetryUnavailableError(
-                    "FastF1 returned an empty telemetry trace."
-                )
-
-        except TelemetryUnavailableError:
-            raise
-
         except Exception as error:
             raise TelemetryImportError(
                 "FastF1 could not retrieve telemetry for this lap."
             ) from error
+
+        return self.import_loaded_lap_telemetry(
+            lap=lap,
+            driver=driver,
+            race_session=race_session,
+            fastf1_session=fastf1_session,
+        )
+
+    def import_loaded_lap_telemetry(
+            self,
+            *,
+            lap: Lap,
+            driver: Driver,
+            race_session: RaceSession,
+            fastf1_session,
+    ) -> int:
+        telemetry = self._get_lap_telemetry(
+            lap=lap,
+            driver=driver,
+            fastf1_session=fastf1_session,
+        )
 
         existing_points = {
             point.sample_index: point
@@ -110,7 +107,7 @@ class TelemetryImportService:
 
         try:
             for sample_index, (_, row) in enumerate(
-                telemetry.iterrows()
+                    telemetry.iterrows()
             ):
                 relative_time_ms = self._timedelta_ms(row.get("Time"))
 
@@ -143,7 +140,6 @@ class TelemetryImportService:
                     self.db.delete(point)
 
             self.db.commit()
-
             return points_upserted
 
         except Exception as error:
@@ -151,6 +147,44 @@ class TelemetryImportService:
 
             raise TelemetryImportError(
                 "Telemetry points could not be saved."
+            ) from error
+
+    def _get_lap_telemetry(
+            self,
+            *,
+            lap: Lap,
+            driver: Driver,
+            fastf1_session,
+    ):
+        try:
+            selected_laps = (
+                fastf1_session.laps
+                .pick_drivers(driver.driver_number)
+                .pick_laps(lap.lap_number)
+            )
+
+            if selected_laps.empty:
+                raise TelemetryUnavailableError(
+                    "FastF1 has no telemetry for this driver lap."
+                )
+
+            telemetry = selected_laps.get_telemetry(
+                frequency="original"
+            )
+
+            if telemetry.empty:
+                raise TelemetryUnavailableError(
+                    "FastF1 returned an empty telemetry trace."
+                )
+
+            return telemetry
+
+        except TelemetryUnavailableError:
+            raise
+
+        except Exception as error:
+            raise TelemetryImportError(
+                "FastF1 could not retrieve telemetry for this lap."
             ) from error
 
     def _apply_values(

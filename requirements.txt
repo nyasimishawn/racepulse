@@ -31,3 +31,6 @@ pytest-cov
 ruff
 
 uvicorn
+
+# Authentication
+PyJWT[crypto]

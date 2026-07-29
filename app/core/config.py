@@ -20,6 +20,26 @@ class Settings(BaseSettings):
     fastf1_cache_path: str = "data/fastf1-cache"
     fastf1_verify_ssl: bool = True
 
+    keycloak_enabled: bool = False
+    keycloak_issuer_url: str = ""
+    keycloak_audience: str = ""
+    keycloak_clock_skew_seconds: int = 30
+
+    @property
+    def keycloak_configured(self) -> bool:
+        return (
+            self.keycloak_enabled
+            and bool(self.keycloak_issuer_url)
+            and bool(self.keycloak_audience)
+        )
+
+    @property
+    def keycloak_jwks_url(self) -> str:
+        issuer_url = self.keycloak_issuer_url.rstrip("/")
+        return (
+            f"{issuer_url}/protocol/openid-connect/certs"
+        )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
