@@ -1,12 +1,21 @@
+from app.models.curated_content import (
+    DriverProfile,
+    EditorialUpdate,
+    ProfileNotableMoment,
+    TeamProfile,
+)
 from app.models.driver import Driver
+from app.models.durable_job import DurableJob
 from app.models.fantasy import (
     FantasyGroup,
     FantasyGroupMember,
+    FantasyGroupWeekendEligibility,
     FantasyGroupWeekendResult,
     FantasyPrediction,
     FantasyPredictionPick,
     FantasyPredictionPickScore,
     FantasyQuestionResolution,
+    FantasyWeekendQuestion,
 )
 from app.models.import_job import ImportJob
 from app.models.lap import Lap
@@ -24,19 +33,26 @@ from app.models.team import Team
 from app.models.telemetry_point import TelemetryPoint
 from app.models.user_profile import UserProfile
 from app.models.weather_sample import WeatherSample
+from app.models.weekend_download import WeekendDownload
 
 __all__ = [
+    "DriverProfile",
+    "EditorialUpdate",
     "Driver",
+    "DurableJob",
     "FantasyGroup",
     "FantasyGroupMember",
+    "FantasyGroupWeekendEligibility",
     "FantasyGroupWeekendResult",
     "FantasyPrediction",
     "FantasyPredictionPick",
     "FantasyPredictionPickScore",
     "FantasyQuestionResolution",
+    "FantasyWeekendQuestion",
     "ImportJob",
     "Lap",
     "Meeting",
+    "ProfileNotableMoment",
     "RaceControlEvent",
     "RaceSession",
     "SessionMapImport",
@@ -45,7 +61,9 @@ __all__ = [
     "SessionResult",
     "SessionTelemetryImport",
     "Team",
+    "TeamProfile",
     "TelemetryPoint",
     "UserProfile",
     "WeatherSample",
+    "WeekendDownload",
 ]

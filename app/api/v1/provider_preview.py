@@ -1,7 +1,9 @@
 from functools import lru_cache
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.providers.base_provider import ProviderError
 from app.providers.fastf1_provider import FastF1Provider
 from app.schemas.provider import FastF1SessionPreviewResponse
@@ -26,7 +28,10 @@ def preview_fastf1_session(
     year: int = Query(ge=2018, le=2100, examples=[2024]),
     event_name: str = Query(min_length=2, examples=["Bahrain"]),
     session_identifier: str = Query(default="R", examples=["R"]),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
 ) -> FastF1SessionPreviewResponse:
+    del current_user
     try:
         preview = get_fastf1_provider().get_session_preview(
             year=year,

@@ -1,4 +1,5 @@
 from bisect import bisect_right
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
@@ -26,6 +27,11 @@ from app.schemas.session_map_import import (
     SessionMapImportCreate,
     SessionMapImportDriverResponse,
 )
+from app.services.durable_job_service import (
+    JobCancellationRequested,
+    JobStateError,
+)
+from app.services.error_message import safe_provider_error_message
 
 
 MAP_READY_MIN_SAMPLE_COUNT = 100
@@ -51,16 +57,39 @@ class SessionMapImportError(RuntimeError):
 
 
 class SessionMapImportService:
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> None:
         self.db = db
         self.fastf1_provider = FastF1Provider()
+        self._cancellation_check = cancellation_check
+        self._progress_callback = progress_callback
 
     def create(
         self,
         *,
         race_session_id: UUID,
         payload: SessionMapImportCreate,
+        idempotency_key: str | None = None,
     ) -> SessionMapImport:
+        normalized_key = (
+            idempotency_key.strip()[:255]
+            if idempotency_key and idempotency_key.strip()
+            else None
+        )
+        if normalized_key is not None:
+            existing = self.db.scalar(
+                select(SessionMapImport).where(
+                    SessionMapImport.idempotency_key == normalized_key
+                )
+            )
+            if existing is not None:
+                return existing
+
         race_session = self.db.get(RaceSession, race_session_id)
 
         if race_session is None:
@@ -76,15 +105,10 @@ class SessionMapImportService:
 
         drivers = sorted(
             [driver for _, driver in rows],
-            key=lambda driver: self._driver_sort_key(
-                driver.driver_number
-            ),
+            key=lambda driver: self._driver_sort_key(driver.driver_number),
         )
 
-        available_numbers = {
-            driver.driver_number
-            for driver in drivers
-        }
+        available_numbers = {driver.driver_number for driver in drivers}
 
         requested_numbers = payload.driver_numbers
 
@@ -117,6 +141,7 @@ class SessionMapImportService:
             sample_interval_ms=payload.sample_interval_ms,
             requested_driver_numbers=requested_numbers,
             drivers_total=len(drivers),
+            idempotency_key=normalized_key,
         )
 
         self.db.add(map_import)
@@ -158,17 +183,10 @@ class SessionMapImportService:
                 Driver,
                 SessionMapImportDriver.driver_id == Driver.id,
             )
-            .where(
-                SessionMapImportDriver.map_import_id
-                == map_import_id
-            )
+            .where(SessionMapImportDriver.map_import_id == map_import_id)
         ).all()
 
-        rows.sort(
-            key=lambda row: self._driver_sort_key(
-                row[1].driver_number
-            )
-        )
+        rows.sort(key=lambda row: self._driver_sort_key(row[1].driver_number))
 
         return [
             SessionMapImportDriverResponse(
@@ -182,9 +200,7 @@ class SessionMapImportService:
                 first_sample_session_time_ms=(
                     item.first_sample_session_time_ms
                 ),
-                last_sample_session_time_ms=(
-                    item.last_sample_session_time_ms
-                ),
+                last_sample_session_time_ms=(item.last_sample_session_time_ms),
                 largest_gap_ms=item.largest_gap_ms,
                 coverage_percent=item.coverage_percent,
                 error_message=item.error_message,
@@ -205,18 +221,18 @@ class SessionMapImportService:
                 "Race session not found."
             )
 
-        eligible_driver_count = self.db.scalar(
-            select(func.count(SessionResult.id)).where(
-                SessionResult.race_session_id == race_session_id
+        eligible_driver_count = (
+            self.db.scalar(
+                select(func.count(SessionResult.id)).where(
+                    SessionResult.race_session_id == race_session_id
+                )
             )
-        ) or 0
+            or 0
+        )
 
         active_import = self.db.scalar(
             select(SessionMapImport)
-            .where(
-                SessionMapImport.race_session_id
-                == race_session_id
-            )
+            .where(SessionMapImport.race_session_id == race_session_id)
             .order_by(SessionMapImport.created_at.desc())
             .limit(1)
         )
@@ -237,8 +253,7 @@ class SessionMapImportService:
         drivers = self.list_drivers(active_import.id)
 
         ready_driver_count = sum(
-            item.status == SessionMapDriverStatus.READY
-            for item in drivers
+            item.status == SessionMapDriverStatus.READY for item in drivers
         )
 
         dataset_ready = (
@@ -252,8 +267,7 @@ class SessionMapImportService:
 
         full_session_track_map_ready = (
             active_import.requested_driver_numbers is None
-            and active_import.status
-            == SessionMapImportStatus.COMPLETED
+            and active_import.status == SessionMapImportStatus.COMPLETED
             and ready_driver_count == eligible_driver_count
         )
 
@@ -265,19 +279,20 @@ class SessionMapImportService:
             eligible_driver_count=eligible_driver_count,
             ready_driver_count=ready_driver_count,
             dataset_ready=dataset_ready,
-            full_session_track_map_ready=(
-                full_session_track_map_ready
-            ),
+            full_session_track_map_ready=(full_session_track_map_ready),
             drivers=drivers,
         )
 
     def run(
         self,
         map_import_id: UUID,
+        *,
+        loaded_session=None,
+        resume: bool = False,
     ) -> SessionMapImport:
         map_import = self.get(map_import_id)
 
-        if map_import.status == SessionMapImportStatus.RUNNING:
+        if map_import.status == SessionMapImportStatus.RUNNING and not resume:
             raise SessionMapImportStateError(
                 "This session map import is already running."
             )
@@ -293,22 +308,27 @@ class SessionMapImportService:
             map_import.started_at = datetime.now(UTC)
 
         self.db.commit()
+        self._report_progress(5)
 
         try:
-            race_session, meeting = self._load_source_context(
-                map_import
-            )
+            self._check_cancellation()
+            race_session, meeting = self._load_source_context(map_import)
 
-            fastf1_session = (
-                self.fastf1_provider.load_telemetry_session(
+            fastf1_session = loaded_session
+            if fastf1_session is None:
+                fastf1_session = self.fastf1_provider.load_telemetry_session(
                     year=meeting.year,
                     event_name=meeting.name,
-                    session_identifier=(
-                        race_session.session_identifier
-                    ),
+                    session_identifier=(race_session.session_identifier),
                 )
-            )
+            self._check_cancellation()
 
+        except JobCancellationRequested:
+            self.db.rollback()
+            raise
+        except JobStateError:
+            self.db.rollback()
+            raise
         except Exception as error:
             self._mark_job_failed(map_import.id, error)
 
@@ -322,19 +342,13 @@ class SessionMapImportService:
                 Driver,
                 SessionMapImportDriver.driver_id == Driver.id,
             )
-            .where(
-                SessionMapImportDriver.map_import_id
-                == map_import.id
-            )
+            .where(SessionMapImportDriver.map_import_id == map_import.id)
         ).all()
 
-        rows.sort(
-            key=lambda row: self._driver_sort_key(
-                row[1].driver_number
-            )
-        )
+        rows.sort(key=lambda row: self._driver_sort_key(row[1].driver_number))
 
         for item, driver in rows:
+            self._check_cancellation()
             if item.status in {
                 SessionMapDriverStatus.READY,
                 SessionMapDriverStatus.PARTIAL,
@@ -352,8 +366,10 @@ class SessionMapImportService:
             )
 
             self._refresh_job_summary(map_import.id, final=False)
+            self._report_progress(self.get(map_import.id).progress_percentage)
 
         self._refresh_job_summary(map_import.id, final=True)
+        self._report_progress(100)
 
         return self.get(map_import.id)
 
@@ -387,6 +403,7 @@ class SessionMapImportService:
         fastf1_session,
         sample_interval_ms: int,
     ) -> None:
+        self._check_cancellation()
         item = self.db.get(SessionMapImportDriver, item_id)
 
         if item is None:
@@ -458,6 +475,7 @@ class SessionMapImportService:
             )
 
             for chunk in self._chunks(records, INSERT_CHUNK_SIZE):
+                self._check_cancellation()
                 self.db.execute(
                     insert(SessionMapSample.__table__),
                     chunk,
@@ -473,8 +491,7 @@ class SessionMapImportService:
 
             is_ready = (
                 len(records) >= MAP_READY_MIN_SAMPLE_COUNT
-                and coverage_percent
-                >= MAP_READY_MIN_COVERAGE_PERCENT
+                and coverage_percent >= MAP_READY_MIN_COVERAGE_PERCENT
                 and largest_gap_ms <= MAP_READY_MAX_GAP_MS
             )
 
@@ -505,6 +522,12 @@ class SessionMapImportService:
 
             self.db.commit()
 
+        except JobCancellationRequested:
+            self.db.rollback()
+            raise
+        except JobStateError:
+            self.db.rollback()
+            raise
         except Exception as error:
             self.db.rollback()
 
@@ -529,10 +552,10 @@ class SessionMapImportService:
     ) -> tuple[list[dict[str, object]], dict[str, object]]:
         candidates: list[dict[str, object]] = []
 
-        for _, row in positions.iterrows():
-            session_time_ms = self._timedelta_ms(
-                row.get("SessionTime")
-            )
+        for index, (_, row) in enumerate(positions.iterrows()):
+            if index % 250 == 0:
+                self._check_cancellation()
+            session_time_ms = self._timedelta_ms(row.get("SessionTime"))
 
             x = self._decimal(row.get("X"))
             y = self._decimal(row.get("Y"))
@@ -547,19 +570,13 @@ class SessionMapImportService:
                     "x": x,
                     "y": y,
                     "z": self._decimal(row.get("Z")),
-                    "position_status": self._text(
-                        row.get("Status")
-                    ),
-                    "sample_source": (
-                        self._text(row.get("Source")) or "pos"
-                    ),
+                    "position_status": self._text(row.get("Status")),
+                    "sample_source": (self._text(row.get("Source")) or "pos"),
                 }
             )
 
         candidates.sort(
-            key=lambda candidate: int(
-                candidate["session_time_ms"]
-            )
+            key=lambda candidate: int(candidate["session_time_ms"])
         )
 
         valid_samples = len(candidates)
@@ -576,16 +593,11 @@ class SessionMapImportService:
         latest_by_bucket: dict[int, dict[str, object]] = {}
 
         for candidate in candidates:
-            bucket = (
-                int(candidate["session_time_ms"])
-                // sample_interval_ms
-            )
+            # Raw mode preserves distinct timestamps without downsampling.
+            bucket = int(candidate["session_time_ms"]) // (sample_interval_ms or 1)
             latest_by_bucket[bucket] = candidate
 
-        selected = [
-            latest_by_bucket[key]
-            for key in sorted(latest_by_bucket)
-        ]
+        selected = [latest_by_bucket[key] for key in sorted(latest_by_bucket)]
 
         starts, windows = self._build_lap_windows(stored_laps)
 
@@ -610,16 +622,13 @@ class SessionMapImportService:
                     "x": candidate["x"],
                     "y": candidate["y"],
                     "z": candidate["z"],
-                    "position_status": candidate[
-                        "position_status"
-                    ],
+                    "position_status": candidate["position_status"],
                     "sample_source": candidate["sample_source"],
                 }
             )
 
         raw_times = [
-            int(candidate["session_time_ms"])
-            for candidate in candidates
+            int(candidate["session_time_ms"]) for candidate in candidates
         ]
 
         largest_gap_ms = max(
@@ -651,11 +660,7 @@ class SessionMapImportService:
                 round(
                     min(
                         100,
-                        (
-                            observed_duration_ms
-                            / expected_duration_ms
-                        )
-                        * 100,
+                        (observed_duration_ms / expected_duration_ms) * 100,
                     ),
                     2,
                 )
@@ -670,14 +675,20 @@ class SessionMapImportService:
             "coverage_percent": coverage_percent,
         }
 
+    def _check_cancellation(self) -> None:
+        if self._cancellation_check is not None:
+            self._cancellation_check()
+
+    def _report_progress(self, progress_percentage: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(progress_percentage)
+
     @staticmethod
     def _build_lap_windows(
         laps: list[Lap],
     ) -> tuple[list[int], list[tuple[int, int, UUID]]]:
         usable_laps = [
-            lap
-            for lap in laps
-            if lap.lap_start_time_ms is not None
+            lap for lap in laps if lap.lap_start_time_ms is not None
         ]
 
         usable_laps.sort(
@@ -693,10 +704,7 @@ class SessionMapImportService:
             start_ms = int(lap.lap_start_time_ms or 0)
 
             next_start_ms = (
-                int(
-                    usable_laps[index + 1].lap_start_time_ms
-                    or start_ms
-                )
+                int(usable_laps[index + 1].lap_start_time_ms or start_ms)
                 if index + 1 < len(usable_laps)
                 else None
             )
@@ -774,20 +782,16 @@ class SessionMapImportService:
         job = self.get(map_import_id)
 
         ready = sum(
-            item.status == SessionMapDriverStatus.READY
-            for item in items
+            item.status == SessionMapDriverStatus.READY for item in items
         )
         partial = sum(
-            item.status == SessionMapDriverStatus.PARTIAL
-            for item in items
+            item.status == SessionMapDriverStatus.PARTIAL for item in items
         )
         skipped = sum(
-            item.status == SessionMapDriverStatus.SKIPPED
-            for item in items
+            item.status == SessionMapDriverStatus.SKIPPED for item in items
         )
         failed = sum(
-            item.status == SessionMapDriverStatus.FAILED
-            for item in items
+            item.status == SessionMapDriverStatus.FAILED for item in items
         )
 
         processed = ready + partial + skipped + failed
@@ -798,10 +802,7 @@ class SessionMapImportService:
         job.drivers_partial = partial
         job.drivers_skipped = skipped
         job.drivers_failed = failed
-        job.samples_written = sum(
-            item.samples_written
-            for item in items
-        )
+        job.samples_written = sum(item.samples_written for item in items)
 
         if final:
             job.progress_percentage = 100
@@ -817,9 +818,7 @@ class SessionMapImportService:
 
         elif job.drivers_total:
             job.progress_percentage = int(
-                round(
-                    processed / job.drivers_total * 100
-                )
+                round(processed / job.drivers_total * 100)
             )
 
         self.db.commit()
@@ -849,7 +848,7 @@ class SessionMapImportService:
         size: int,
     ):
         for start in range(0, len(values), size):
-            yield values[start:start + size]
+            yield values[start : start + size]
 
     @staticmethod
     def _text(value: object) -> str | None:
@@ -940,4 +939,7 @@ class SessionMapImportService:
 
     @staticmethod
     def _error_text(error: Exception) -> str:
-        return f"{type(error).__name__}: {error}"[:2_000]
+        return safe_provider_error_message(
+            error,
+            operation="FastF1 map import",
+        )

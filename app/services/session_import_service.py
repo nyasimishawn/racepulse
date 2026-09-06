@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
@@ -13,6 +14,11 @@ from app.models.race_session import RaceSession
 from app.models.session_result import SessionResult
 from app.models.team import Team
 from app.providers.fastf1_provider import FastF1Provider
+from app.services.durable_job_service import (
+    JobCancellationRequested,
+    JobStateError,
+)
+from app.services.error_message import safe_provider_error_message
 
 
 class ImportJobNotFoundError(LookupError):
@@ -28,11 +34,25 @@ class SessionImportError(RuntimeError):
 
 
 class SessionImportService:
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> None:
         self.db = db
         self.fastf1_provider = FastF1Provider()
+        self._cancellation_check = cancellation_check
+        self._progress_callback = progress_callback
 
-    def run(self, job_id: UUID) -> ImportJob:
+    def run(
+        self,
+        job_id: UUID,
+        *,
+        loaded_session=None,
+        resume: bool = False,
+    ) -> ImportJob:
         job = self.db.get(ImportJob, job_id)
 
         if job is None:
@@ -43,7 +63,7 @@ class SessionImportService:
                 "Only FASTF1 imports are supported at this stage."
             )
 
-        if job.status == ImportJobStatus.RUNNING:
+        if job.status == ImportJobStatus.RUNNING and not resume:
             raise ImportJobStateError("This import job is already running.")
 
         if (
@@ -58,15 +78,23 @@ class SessionImportService:
         job.started_at = datetime.now(UTC)
         job.completed_at = None
         self.db.commit()
+        self._report_progress(job.progress_percentage)
 
         try:
-            fastf1_session = self.fastf1_provider.load_results_session(
-                year=job.year,
-                event_name=job.event_name,
-                session_identifier=self._fastf1_identifier(job.session_type),
-            )
+            self._check_cancellation()
+            fastf1_session = loaded_session
+            if fastf1_session is None:
+                fastf1_session = self.fastf1_provider.load_results_session(
+                    year=job.year,
+                    event_name=job.event_name,
+                    session_identifier=self._fastf1_identifier(
+                        job.session_type
+                    ),
+                )
+            self._check_cancellation()
 
             job.progress_percentage = 45
+            self._report_progress(job.progress_percentage)
 
             meeting = self._upsert_meeting(job, fastf1_session)
             self.db.flush()
@@ -78,7 +106,12 @@ class SessionImportService:
             )
             self.db.flush()
 
-            for _, result_row in fastf1_session.results.iterrows():
+            result_count = len(fastf1_session.results.index)
+            for index, (_, result_row) in enumerate(
+                fastf1_session.results.iterrows(),
+                start=1,
+            ):
+                self._check_cancellation()
                 driver = self._upsert_driver(result_row)
                 team = self._upsert_team(result_row)
 
@@ -90,6 +123,8 @@ class SessionImportService:
                     team=team,
                     result_row=result_row,
                 )
+                if result_count:
+                    self._report_progress(45 + int(index / result_count * 45))
 
             job.progress_percentage = 90
             job.imported_session_id = race_session.id
@@ -99,9 +134,16 @@ class SessionImportService:
 
             self.db.commit()
             self.db.refresh(job)
+            self._report_progress(100)
 
             return job
 
+        except JobCancellationRequested:
+            self.db.rollback()
+            raise
+        except JobStateError:
+            self.db.rollback()
+            raise
         except Exception as error:
             self.db.rollback()
 
@@ -109,9 +151,10 @@ class SessionImportService:
 
             if failed_job is not None:
                 failed_job.status = ImportJobStatus.FAILED
-                failed_job.error_message = (
-                    f"{type(error).__name__}: {error}"
-                )[:2000]
+                failed_job.error_message = safe_provider_error_message(
+                    error,
+                    operation="FastF1 session import",
+                )
                 failed_job.completed_at = datetime.now(UTC)
 
                 self.db.commit()
@@ -119,6 +162,14 @@ class SessionImportService:
             raise SessionImportError(
                 "FastF1 import failed. Check the import job for details."
             ) from error
+
+    def _check_cancellation(self) -> None:
+        if self._cancellation_check is not None:
+            self._cancellation_check()
+
+    def _report_progress(self, progress_percentage: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(progress_percentage)
 
     def _upsert_meeting(self, job: ImportJob, fastf1_session) -> Meeting:
         event = fastf1_session.event
@@ -168,6 +219,15 @@ class SessionImportService:
         )
 
         if race_session is None:
+            # Reuse older practice imports with full-name identifiers.
+            race_session = self.db.scalar(
+                select(RaceSession).where(
+                    RaceSession.meeting_id == meeting.id,
+                    RaceSession.session_type == session_type,
+                )
+            )
+
+        if race_session is None:
             race_session = RaceSession(
                 meeting_id=meeting.id,
                 session_identifier=session_identifier,
@@ -177,6 +237,7 @@ class SessionImportService:
             self.db.add(race_session)
 
         race_session.name = fastf1_session.name or session_type
+        race_session.session_identifier = session_identifier
         race_session.session_type = session_type
         race_session.started_at = self._datetime(fastf1_session.date)
 
@@ -219,11 +280,12 @@ class SessionImportService:
         driver_number = self._text(result_row.get("DriverNumber"))
 
         if driver_number is None:
-            raise ValueError("FastF1 returned a result without a driver number.")
+            raise ValueError(
+                "FastF1 returned a result without a driver number."
+            )
 
         source_identifier = (
-            self._text(result_row.get("DriverId"))
-            or f"number:{driver_number}"
+            self._text(result_row.get("DriverId")) or f"number:{driver_number}"
         )
 
         driver = self.db.scalar(
@@ -314,8 +376,15 @@ class SessionImportService:
             "Q": "Q",
             "QUALIFYING": "Q",
             "FP1": "FP1",
+            "PRACTICE 1": "FP1",
             "FP2": "FP2",
+            "PRACTICE 2": "FP2",
             "FP3": "FP3",
+            "PRACTICE 3": "FP3",
+            "SPRINT QUALIFYING": "SQ",
+            "SQ": "SQ",
+            "SPRINT SHOOTOUT": "SS",
+            "SS": "SS",
             "S": "S",
             "SPRINT": "S",
         }

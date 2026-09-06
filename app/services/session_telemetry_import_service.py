@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -29,6 +30,11 @@ from app.services.telemetry_service import (
     TelemetryImportService,
     TelemetryUnavailableError,
 )
+from app.services.durable_job_service import (
+    JobCancellationRequested,
+    JobStateError,
+)
+from app.services.error_message import safe_provider_error_message
 
 
 class SessionTelemetryImportNotFoundError(LookupError):
@@ -52,6 +58,9 @@ class SessionTelemetryImportService:
         self,
         db: Session,
         lap_telemetry_importer: TelemetryImportService | None = None,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> None:
         self.db = db
         self.lap_telemetry_importer = (
@@ -59,13 +68,30 @@ class SessionTelemetryImportService:
             if lap_telemetry_importer is not None
             else TelemetryImportService(db)
         )
+        self._cancellation_check = cancellation_check
+        self._progress_callback = progress_callback
 
     def create(
         self,
         *,
         race_session_id: UUID,
         payload: SessionTelemetryImportCreate,
+        idempotency_key: str | None = None,
     ) -> SessionTelemetryImport:
+        normalized_key = (
+            idempotency_key.strip()[:255]
+            if idempotency_key and idempotency_key.strip()
+            else None
+        )
+        if normalized_key is not None:
+            existing = self.db.scalar(
+                select(SessionTelemetryImport).where(
+                    SessionTelemetryImport.idempotency_key == normalized_key
+                )
+            )
+            if existing is not None:
+                return existing
+
         race_session = self.db.get(RaceSession, race_session_id)
 
         if race_session is None:
@@ -74,10 +100,7 @@ class SessionTelemetryImportService:
             )
 
         drivers = self._drivers_for_session(race_session_id)
-        available_numbers = {
-            driver.driver_number
-            for driver in drivers
-        }
+        available_numbers = {driver.driver_number for driver in drivers}
 
         if payload.driver_numbers is not None:
             unknown_numbers = sorted(
@@ -124,9 +147,9 @@ class SessionTelemetryImportService:
             driver_results=driver_results,
             drivers_total=len(driver_results),
             laps_requested=sum(
-                int(result["laps_requested"])
-                for result in driver_results
+                int(result["laps_requested"]) for result in driver_results
             ),
+            idempotency_key=normalized_key,
         )
 
         self.db.add(telemetry_import)
@@ -158,9 +181,7 @@ class SessionTelemetryImportService:
         telemetry_import = self.get(telemetry_import_id)
 
         return [
-            SessionTelemetryImportDriverResponse.model_validate(
-                result
-            )
+            SessionTelemetryImportDriverResponse.model_validate(result)
             for result in telemetry_import.driver_results
         ]
 
@@ -181,9 +202,7 @@ class SessionTelemetryImportService:
                 Driver.abbreviation,
                 Driver.full_name,
                 func.count(func.distinct(Lap.id)),
-                func.count(
-                    func.distinct(TelemetryPoint.lap_id)
-                ),
+                func.count(func.distinct(TelemetryPoint.lap_id)),
                 func.count(TelemetryPoint.id),
             )
             .join(
@@ -201,9 +220,7 @@ class SessionTelemetryImportService:
                 TelemetryPoint,
                 TelemetryPoint.lap_id == Lap.id,
             )
-            .where(
-                SessionResult.race_session_id == race_session_id
-            )
+            .where(SessionResult.race_session_id == race_session_id)
             .group_by(
                 Driver.id,
                 Driver.driver_number,
@@ -236,52 +253,37 @@ class SessionTelemetryImportService:
         ]
 
         drivers.sort(
-            key=lambda driver: self._driver_sort_key(
-                driver.driver_number
-            )
+            key=lambda driver: self._driver_sort_key(driver.driver_number)
         )
 
         latest_import = self.db.scalar(
             select(SessionTelemetryImport)
-            .where(
-                SessionTelemetryImport.race_session_id
-                == race_session_id
-            )
-            .order_by(
-                SessionTelemetryImport.created_at.desc()
-            )
+            .where(SessionTelemetryImport.race_session_id == race_session_id)
+            .order_by(SessionTelemetryImport.created_at.desc())
             .limit(1)
         )
 
         imported_lap_count = sum(
-            driver.imported_lap_count
-            for driver in drivers
+            driver.imported_lap_count for driver in drivers
         )
         telemetry_lap_count = sum(
-            driver.telemetry_lap_count
-            for driver in drivers
+            driver.telemetry_lap_count for driver in drivers
         )
         telemetry_point_count = sum(
-            driver.telemetry_point_count
-            for driver in drivers
+            driver.telemetry_point_count for driver in drivers
         )
 
         return SessionTelemetryCoverageResponse(
             race_session_id=race_session_id,
             latest_telemetry_import_id=(
-                latest_import.id
-                if latest_import is not None
-                else None
+                latest_import.id if latest_import is not None else None
             ),
             latest_telemetry_import_status=(
-                latest_import.status
-                if latest_import is not None
-                else None
+                latest_import.status if latest_import is not None else None
             ),
             eligible_driver_count=len(drivers),
             drivers_with_telemetry=sum(
-                driver.telemetry_lap_count > 0
-                for driver in drivers
+                driver.telemetry_lap_count > 0 for driver in drivers
             ),
             imported_lap_count=imported_lap_count,
             telemetry_lap_count=telemetry_lap_count,
@@ -297,21 +299,21 @@ class SessionTelemetryImportService:
     def run(
         self,
         telemetry_import_id: UUID,
+        *,
+        loaded_session=None,
+        resume: bool = False,
     ) -> SessionTelemetryImport:
         telemetry_import = self.get(telemetry_import_id)
 
         if (
-            telemetry_import.status
-            == SessionTelemetryImportStatus.RUNNING
+            telemetry_import.status == SessionTelemetryImportStatus.RUNNING
+            and not resume
         ):
             raise SessionTelemetryImportStateError(
                 "This session telemetry import is already running."
             )
 
-        if (
-            telemetry_import.status
-            == SessionTelemetryImportStatus.COMPLETED
-        ):
+        if telemetry_import.status == SessionTelemetryImportStatus.COMPLETED:
             return telemetry_import
 
         telemetry_import.status = SessionTelemetryImportStatus.RUNNING
@@ -322,19 +324,25 @@ class SessionTelemetryImportService:
             telemetry_import.started_at = datetime.now(UTC)
 
         self.db.commit()
+        self._report_progress(5)
 
         try:
-            race_session, meeting = self._load_source_context(
-                telemetry_import
-            )
-            fastf1_session = (
-                self.lap_telemetry_importer.fastf1_provider
-                .load_telemetry_session(
+            self._check_cancellation()
+            race_session, meeting = self._load_source_context(telemetry_import)
+            fastf1_session = loaded_session
+            if fastf1_session is None:
+                fastf1_session = self.lap_telemetry_importer.fastf1_provider.load_telemetry_session(
                     year=meeting.year,
                     event_name=meeting.name,
                     session_identifier=race_session.session_identifier,
                 )
-            )
+            self._check_cancellation()
+        except JobCancellationRequested:
+            self.db.rollback()
+            raise
+        except JobStateError:
+            self.db.rollback()
+            raise
         except Exception as error:
             self._mark_job_failed(telemetry_import.id, error)
 
@@ -344,19 +352,20 @@ class SessionTelemetryImportService:
 
         drivers_by_number = {
             driver.driver_number: driver
-            for driver in self._drivers_for_session(
-                race_session.id
-            )
+            for driver in self._drivers_for_session(race_session.id)
         }
 
         for result in self._driver_results(telemetry_import.id):
+            self._check_cancellation()
             status = result["status"]
 
             if status in {
                 SessionTelemetryDriverStatus.READY.value,
-                SessionTelemetryDriverStatus.PARTIAL.value,
                 SessionTelemetryDriverStatus.SKIPPED.value,
-            }:
+            } or (
+                status == SessionTelemetryDriverStatus.PARTIAL.value
+                and not result.get("failed_lap_numbers")
+            ):
                 continue
 
             driver_number = str(result["driver_number"])
@@ -384,11 +393,15 @@ class SessionTelemetryImportService:
                 telemetry_import.id,
                 final=False,
             )
+            self._report_progress(
+                self.get(telemetry_import.id).progress_percentage
+            )
 
         self._refresh_job_summary(
             telemetry_import.id,
             final=True,
         )
+        self._report_progress(100)
 
         return self.get(telemetry_import.id)
 
@@ -402,10 +415,7 @@ class SessionTelemetryImportService:
                 Meeting,
                 RaceSession.meeting_id == Meeting.id,
             )
-            .where(
-                RaceSession.id
-                == telemetry_import.race_session_id
-            )
+            .where(RaceSession.id == telemetry_import.race_session_id)
         ).one_or_none()
 
         if context is None:
@@ -424,6 +434,7 @@ class SessionTelemetryImportService:
         result: dict[str, object],
         fastf1_session,
     ) -> None:
+        self._check_cancellation()
         running_result = {
             **result,
             "status": SessionTelemetryDriverStatus.RUNNING.value,
@@ -449,9 +460,7 @@ class SessionTelemetryImportService:
 
         selected_lap_numbers = [
             int(lap_number)
-            for lap_number in running_result[
-                "selected_lap_numbers"
-            ]
+            for lap_number in running_result["selected_lap_numbers"]
         ]
 
         if not selected_lap_numbers:
@@ -470,10 +479,7 @@ class SessionTelemetryImportService:
             driver_id=driver.id,
             selected_lap_numbers=selected_lap_numbers,
         )
-        laps_by_number = {
-            lap.lap_number: lap
-            for lap in stored_laps
-        }
+        laps_by_number = {lap.lap_number: lap for lap in stored_laps}
 
         unavailable_laps: list[int] = []
         failed_laps: list[int] = []
@@ -481,6 +487,7 @@ class SessionTelemetryImportService:
         points_written = 0
 
         for lap_number in selected_lap_numbers:
+            self._check_cancellation()
             lap = laps_by_number.get(lap_number)
 
             if lap is None:
@@ -489,8 +496,7 @@ class SessionTelemetryImportService:
 
             try:
                 lap_points = (
-                    self.lap_telemetry_importer
-                    .import_loaded_lap_telemetry(
+                    self.lap_telemetry_importer.import_loaded_lap_telemetry(
                         lap=lap,
                         driver=driver,
                         race_session=race_session,
@@ -505,6 +511,12 @@ class SessionTelemetryImportService:
                 successful_laps += 1
                 points_written += lap_points
 
+            except JobCancellationRequested:
+                self.db.rollback()
+                raise
+            except JobStateError:
+                self.db.rollback()
+                raise
             except TelemetryUnavailableError:
                 unavailable_laps.append(lap_number)
 
@@ -547,6 +559,14 @@ class SessionTelemetryImportService:
             result=completed_result,
         )
 
+    def _check_cancellation(self) -> None:
+        if self._cancellation_check is not None:
+            self._cancellation_check()
+
+    def _report_progress(self, progress_percentage: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(progress_percentage)
+
     def _selected_stored_laps(
         self,
         *,
@@ -564,10 +584,7 @@ class SessionTelemetryImportService:
             .order_by(Lap.lap_number)
         ).all()
 
-        laps_by_number = {
-            lap.lap_number: lap
-            for lap in laps
-        }
+        laps_by_number = {lap.lap_number: lap for lap in laps}
 
         return [
             laps_by_number[lap_number]
@@ -580,7 +597,7 @@ class SessionTelemetryImportService:
         *,
         race_session_id: UUID,
         driver: Driver,
-        max_laps: int,
+        max_laps: int | None,
         clean_laps_only: bool,
     ) -> list[Lap]:
         laps = self.db.scalars(
@@ -591,6 +608,11 @@ class SessionTelemetryImportService:
             )
             .order_by(Lap.lap_number)
         ).all()
+
+        if max_laps is None and not clean_laps_only:
+            # Full-weekend imports attempt every stored lap, including pit,
+            # deleted and incomplete laps. Missing telemetry is reported.
+            return list(laps)
 
         eligible_laps = [
             lap
@@ -606,7 +628,8 @@ class SessionTelemetryImportService:
         selected: list[Lap] = []
         index = 0
 
-        while len(selected) < max_laps:
+        lap_limit = max_laps if max_laps is not None else len(eligible_laps)
+        while len(selected) < lap_limit:
             added_lap = False
 
             for stint in stint_groups:
@@ -616,7 +639,7 @@ class SessionTelemetryImportService:
                 selected.append(stint[index])
                 added_lap = True
 
-                if len(selected) == max_laps:
+                if len(selected) == lap_limit:
                     break
 
             if not added_lap:
@@ -640,18 +663,13 @@ class SessionTelemetryImportService:
                     SessionResult,
                     SessionResult.driver_id == Driver.id,
                 )
-                .where(
-                    SessionResult.race_session_id
-                    == race_session_id
-                )
+                .where(SessionResult.race_session_id == race_session_id)
             ).all()
         )
 
         return sorted(
             drivers,
-            key=lambda driver: self._driver_sort_key(
-                driver.driver_number
-            ),
+            key=lambda driver: self._driver_sort_key(driver.driver_number),
         )
 
     def _new_driver_result(
@@ -660,10 +678,7 @@ class SessionTelemetryImportService:
         driver: Driver,
         selected_laps: list[Lap],
     ) -> dict[str, object]:
-        selected_lap_numbers = [
-            lap.lap_number
-            for lap in selected_laps
-        ]
+        selected_lap_numbers = [lap.lap_number for lap in selected_laps]
 
         return {
             "driver_number": driver.driver_number,
@@ -694,26 +709,19 @@ class SessionTelemetryImportService:
         current_driver_number: str | None = None,
     ) -> None:
         telemetry_import = self.get(telemetry_import_id)
-        results = [
-            dict(item)
-            for item in telemetry_import.driver_results
-        ]
+        results = [dict(item) for item in telemetry_import.driver_results]
 
         for index, item in enumerate(results):
             if item["driver_number"] == driver_number:
                 results[index] = result
                 break
         else:
-            raise RuntimeError(
-                "Telemetry import driver result disappeared."
-            )
+            raise RuntimeError("Telemetry import driver result disappeared.")
 
         telemetry_import.driver_results = results
 
         if current_driver_number is not None:
-            telemetry_import.current_driver_number = (
-                current_driver_number
-            )
+            telemetry_import.current_driver_number = current_driver_number
 
         self.db.commit()
 
@@ -723,10 +731,7 @@ class SessionTelemetryImportService:
     ) -> list[dict[str, object]]:
         telemetry_import = self.get(telemetry_import_id)
 
-        return [
-            dict(item)
-            for item in telemetry_import.driver_results
-        ]
+        return [dict(item) for item in telemetry_import.driver_results]
 
     def _refresh_job_summary(
         self,
@@ -738,23 +743,19 @@ class SessionTelemetryImportService:
         results = self._driver_results(telemetry_import_id)
 
         ready = sum(
-            result["status"]
-            == SessionTelemetryDriverStatus.READY.value
+            result["status"] == SessionTelemetryDriverStatus.READY.value
             for result in results
         )
         partial = sum(
-            result["status"]
-            == SessionTelemetryDriverStatus.PARTIAL.value
+            result["status"] == SessionTelemetryDriverStatus.PARTIAL.value
             for result in results
         )
         skipped = sum(
-            result["status"]
-            == SessionTelemetryDriverStatus.SKIPPED.value
+            result["status"] == SessionTelemetryDriverStatus.SKIPPED.value
             for result in results
         )
         failed = sum(
-            result["status"]
-            == SessionTelemetryDriverStatus.FAILED.value
+            result["status"] == SessionTelemetryDriverStatus.FAILED.value
             for result in results
         )
 
@@ -768,28 +769,22 @@ class SessionTelemetryImportService:
         telemetry_import.drivers_failed = failed
 
         telemetry_import.laps_requested = sum(
-            int(result["laps_requested"])
-            for result in results
+            int(result["laps_requested"]) for result in results
         )
         telemetry_import.laps_processed = sum(
-            int(result["laps_processed"])
-            for result in results
+            int(result["laps_processed"]) for result in results
         )
         telemetry_import.laps_with_telemetry = sum(
-            int(result["laps_with_telemetry"])
-            for result in results
+            int(result["laps_with_telemetry"]) for result in results
         )
         telemetry_import.laps_unavailable = sum(
-            int(result["laps_unavailable"])
-            for result in results
+            int(result["laps_unavailable"]) for result in results
         )
         telemetry_import.laps_failed = sum(
-            int(result["laps_failed"])
-            for result in results
+            int(result["laps_failed"]) for result in results
         )
         telemetry_import.points_written = sum(
-            int(result["points_written"])
-            for result in results
+            int(result["points_written"]) for result in results
         )
 
         if final:
@@ -803,27 +798,19 @@ class SessionTelemetryImportService:
                 )
                 telemetry_import.error_message = None
             elif ready + partial > 0:
-                telemetry_import.status = (
-                    SessionTelemetryImportStatus.PARTIAL
-                )
+                telemetry_import.status = SessionTelemetryImportStatus.PARTIAL
                 telemetry_import.error_message = (
                     "Some selected driver laps did not expose "
                     "usable FastF1 telemetry."
                 )
             else:
-                telemetry_import.status = (
-                    SessionTelemetryImportStatus.FAILED
-                )
+                telemetry_import.status = SessionTelemetryImportStatus.FAILED
                 telemetry_import.error_message = (
                     "No selected driver lap produced stored telemetry."
                 )
         elif telemetry_import.drivers_total:
             telemetry_import.progress_percentage = int(
-                round(
-                    processed
-                    / telemetry_import.drivers_total
-                    * 100
-                )
+                round(processed / telemetry_import.drivers_total * 100)
             )
 
         self.db.commit()
@@ -877,8 +864,7 @@ class SessionTelemetryImportService:
             source_stint = current_stint[0].stint
 
             starts_new_stint = (
-                lap.stint is not None
-                and lap.stint != source_stint
+                lap.stint is not None and lap.stint != source_stint
             ) or (
                 previous_lap.compound is not None
                 and lap.compound is not None
@@ -968,9 +954,7 @@ class SessionTelemetryImportService:
             return Decimal("0.00")
 
         return (
-            Decimal(numerator)
-            * Decimal("100")
-            / Decimal(denominator)
+            Decimal(numerator) * Decimal("100") / Decimal(denominator)
         ).quantize(Decimal("0.01"))
 
     @staticmethod
@@ -986,4 +970,7 @@ class SessionTelemetryImportService:
 
     @staticmethod
     def _error_text(error: Exception) -> str:
-        return f"{type(error).__name__}: {error}"[:500]
+        return safe_provider_error_message(
+            error,
+            operation="FastF1 telemetry import",
+        )

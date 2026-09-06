@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
@@ -13,6 +14,10 @@ from app.models.race_session import RaceSession
 from app.models.session_result import SessionResult
 from app.providers.fastf1_provider import FastF1Provider
 from app.schemas.lap import LapResponse
+from app.services.durable_job_service import (
+    JobCancellationRequested,
+    JobStateError,
+)
 
 
 class RaceSessionNotFoundError(LookupError):
@@ -24,11 +29,24 @@ class LapImportError(RuntimeError):
 
 
 class LapImportService:
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> None:
         self.db = db
         self.fastf1_provider = FastF1Provider()
+        self._cancellation_check = cancellation_check
+        self._progress_callback = progress_callback
 
-    def import_laps(self, race_session_id: UUID) -> tuple[int, int]:
+    def import_laps(
+        self,
+        race_session_id: UUID,
+        *,
+        loaded_session=None,
+    ) -> tuple[int, int]:
         context = self.db.execute(
             select(RaceSession, Meeting)
             .join(Meeting, RaceSession.meeting_id == Meeting.id)
@@ -41,11 +59,19 @@ class LapImportService:
         race_session, meeting = context
 
         try:
-            fastf1_session = self.fastf1_provider.load_laps_session(
-                year=meeting.year,
-                event_name=meeting.name,
-                session_identifier=race_session.session_identifier,
-            )
+            self._check_cancellation()
+            fastf1_session = loaded_session
+            if fastf1_session is None:
+                fastf1_session = self.fastf1_provider.load_laps_session(
+                    year=meeting.year,
+                    event_name=meeting.name,
+                    session_identifier=race_session.session_identifier,
+                )
+            self._check_cancellation()
+        except JobCancellationRequested:
+            raise
+        except JobStateError:
+            raise
         except Exception as error:
             raise LapImportError(
                 "FastF1 could not load lap data for this session."
@@ -58,8 +84,7 @@ class LapImportService:
         ).all()
 
         drivers_by_number = {
-            driver.driver_number: driver
-            for driver in drivers
+            driver.driver_number: driver for driver in drivers
         }
 
         existing_laps = {
@@ -73,7 +98,13 @@ class LapImportService:
         laps_skipped = 0
 
         try:
-            for _, lap_row in fastf1_session.laps.iterrows():
+            lap_count = len(fastf1_session.laps.index)
+            self._report_progress(5)
+            for index, (_, lap_row) in enumerate(
+                fastf1_session.laps.iterrows(),
+                start=1,
+            ):
+                self._check_cancellation()
                 driver_number = self._text(lap_row.get("DriverNumber"))
                 lap_number = self._integer(lap_row.get("LapNumber"))
 
@@ -96,11 +127,20 @@ class LapImportService:
 
                 self._apply_lap_values(lap, lap_row)
                 laps_upserted += 1
+                if lap_count and index % 25 == 0:
+                    self._report_progress(5 + int(index / lap_count * 90))
 
             self.db.commit()
+            self._report_progress(100)
 
             return laps_upserted, laps_skipped
 
+        except JobCancellationRequested:
+            self.db.rollback()
+            raise
+        except JobStateError:
+            self.db.rollback()
+            raise
         except Exception as error:
             self.db.rollback()
 
@@ -108,23 +148,23 @@ class LapImportService:
                 "Lap data could not be saved to the database."
             ) from error
 
+    def _check_cancellation(self) -> None:
+        if self._cancellation_check is not None:
+            self._cancellation_check()
+
+    def _report_progress(self, progress_percentage: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(progress_percentage)
+
     def _apply_lap_values(self, lap: Lap, row: pd.Series) -> None:
         lap.lap_start_at = self._datetime(row.get("LapStartDate"))
 
-        lap.lap_start_time_ms = self._timedelta_ms(
-            row.get("LapStartTime")
-        )
+        lap.lap_start_time_ms = self._timedelta_ms(row.get("LapStartTime"))
         lap.lap_time_ms = self._timedelta_ms(row.get("LapTime"))
 
-        lap.sector_1_time_ms = self._timedelta_ms(
-            row.get("Sector1Time")
-        )
-        lap.sector_2_time_ms = self._timedelta_ms(
-            row.get("Sector2Time")
-        )
-        lap.sector_3_time_ms = self._timedelta_ms(
-            row.get("Sector3Time")
-        )
+        lap.sector_1_time_ms = self._timedelta_ms(row.get("Sector1Time"))
+        lap.sector_2_time_ms = self._timedelta_ms(row.get("Sector2Time"))
+        lap.sector_3_time_ms = self._timedelta_ms(row.get("Sector3Time"))
 
         lap.speed_i1 = self._decimal(row.get("SpeedI1"))
         lap.speed_i2 = self._decimal(row.get("SpeedI2"))
@@ -142,17 +182,13 @@ class LapImportService:
         lap.track_status = self._text(row.get("TrackStatus"))
         lap.position = self._integer(row.get("Position"))
 
-        lap.is_personal_best = self._boolean(
-            row.get("IsPersonalBest")
-        )
+        lap.is_personal_best = self._boolean(row.get("IsPersonalBest"))
         lap.is_accurate = self._boolean(row.get("IsAccurate"))
 
         lap.deleted = self._boolean(row.get("Deleted"))
         lap.deleted_reason = self._text(row.get("DeletedReason"))
 
-        lap.fastf1_generated = self._boolean(
-            row.get("FastF1Generated")
-        )
+        lap.fastf1_generated = self._boolean(row.get("FastF1Generated"))
 
     @staticmethod
     def _text(value: object) -> str | None:

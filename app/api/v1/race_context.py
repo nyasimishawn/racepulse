@@ -1,9 +1,13 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.db.database import get_db
+from app.models.durable_job import DurableJobType
+from app.schemas.durable_job import DurableJobResponse
 from app.schemas.race_context import (
     PitEventResponse,
     RaceContextImportResponse,
@@ -18,6 +22,7 @@ from app.services.race_context_service import (
     RaceContextSessionNotFoundError,
     RaceContextValidationError,
 )
+from app.services.job_dispatch_service import enqueue_job
 
 router = APIRouter(
     prefix="/sessions/{race_session_id}",
@@ -28,12 +33,16 @@ router = APIRouter(
 @router.post(
     "/context/import",
     response_model=RaceContextImportResponse,
-    summary="Import weather and race-control context from FastF1",
+    summary="Legacy synchronous FastF1 race-context import",
+    deprecated=True,
 )
 def import_context(
     race_session_id: UUID,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> RaceContextImportResponse:
+    del current_user
     try:
         return RaceContextService(db).import_context(
             race_session_id
@@ -186,3 +195,34 @@ def get_timeline(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(error),
         ) from error
+
+
+@router.post(
+    "/context/import-jobs",
+    response_model=DurableJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue race-context import work",
+)
+def queue_context_import(
+    race_session_id: UUID,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
+    db: Session = Depends(get_db),
+) -> DurableJobResponse:
+    del current_user
+    return enqueue_job(
+        db,
+        job_type=DurableJobType.RACE_CONTEXT_IMPORT,
+        target_id=race_session_id,
+        idempotency_key=(
+            f"race-context-import:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"race_session_id": str(race_session_id)},
+    )

@@ -3,6 +3,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.db.database import get_db
 from app.schemas.telemetry import (
     TelemetryImportResponse,
@@ -34,8 +36,11 @@ def import_telemetry(
     race_session_id: UUID,
     driver_number: str,
     lap_number: int,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> TelemetryImportResponse:
+    del current_user
     try:
         telemetry_points_upserted = TelemetryImportService(
             db

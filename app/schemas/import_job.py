@@ -29,6 +29,7 @@ class ImportJobResponse(BaseModel):
     status: ImportJobStatus
     progress_percentage: int
     error_message: str | None
+    durable_job_id: UUID | None
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime

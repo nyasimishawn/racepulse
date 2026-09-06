@@ -1,14 +1,11 @@
 from datetime import datetime
+import logging
 from pathlib import Path
 
 import fastf1
 import pandas as pd
-import logging
-
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
-
-logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.providers.base_provider import (
@@ -17,6 +14,10 @@ from app.providers.base_provider import (
     SessionPreview,
     TimingDataProvider,
 )
+from app.schemas.weekend import WeekendSchedule, WeekendSessionSchedule
+
+
+logger = logging.getLogger(__name__)
 
 
 class FastF1Provider(TimingDataProvider):
@@ -28,6 +29,104 @@ class FastF1Provider(TimingDataProvider):
 
         fastf1.Cache.enable_cache(str(cache_path))
         self._configure_ssl_verification()
+
+    def get_weekend_schedule(
+        self,
+        *,
+        year: int,
+        event_name: str,
+    ) -> WeekendSchedule:
+        """Resolve a location/name against the schedule, without loading data."""
+        try:
+            schedule = fastf1.get_event_schedule(year, include_testing=False)
+        except Exception as error:
+            raise ProviderError("The race schedule is unavailable.") from error
+        query = " ".join(event_name.casefold().split())
+        matches = []
+        alias_counts: dict[str, int] = {}
+        for _, event in schedule.iterrows():
+            aliases = {
+                " ".join(str(event.get(field, "")).casefold().split())
+                for field in (
+                    "EventName",
+                    "OfficialEventName",
+                    "Location",
+                    "Country",
+                )
+            }
+            aliases.add(str(int(event["RoundNumber"])))
+            for alias in aliases:
+                alias_counts[alias] = alias_counts.get(alias, 0) + 1
+            if query in aliases:
+                matches.append((event, aliases))
+        if len(matches) != 1:
+            raise ValueError(
+                "Select an exact event name, circuit location or round number "
+                "from this season."
+            )
+        event, aliases = matches[0]
+        identifiers = {
+            "Practice 1": "FP1",
+            "Practice 2": "FP2",
+            "Practice 3": "FP3",
+            "Qualifying": "Q",
+            "Race": "R",
+            "Sprint": "S",
+            "Sprint Shootout": "SS",
+            "Sprint Qualifying": "SQ",
+        }
+        sessions = []
+        for index in range(1, 6):
+            name = self._text(event.get(f"Session{index}"))
+            if name is None:
+                continue
+            scheduled_at = event.get(f"Session{index}DateUtc")
+            if pd.isna(scheduled_at):
+                scheduled_at = None
+            elif scheduled_at is not None:
+                scheduled_at = pd.Timestamp(scheduled_at)
+                if scheduled_at.tzinfo is None:
+                    scheduled_at = scheduled_at.tz_localize("UTC")
+                scheduled_at = scheduled_at.to_pydatetime()
+            sessions.append(
+                WeekendSessionSchedule(
+                    identifier=identifiers.get(name, name),
+                    name=name,
+                    scheduled_at=scheduled_at,
+                )
+            )
+        if not sessions:
+            raise ValueError("This weekend has no scheduled sessions.")
+        return WeekendSchedule(
+            year=year,
+            round_number=int(event["RoundNumber"]),
+            event_name=str(event["EventName"]),
+            aliases=sorted(
+                alias for alias in aliases - {"", "nan", "none"}
+                if alias_counts[alias] == 1
+            ),
+            sessions=sessions,
+        )
+
+    def load_full_session(
+        self,
+        *,
+        year: int,
+        round_number: int,
+        session_identifier: str,
+    ):
+        try:
+            session = fastf1.get_session(
+                year, round_number, session_identifier
+            )
+            session.load(
+                laps=True, telemetry=True, weather=True, messages=True
+            )
+            return session
+        except Exception as error:
+            raise ProviderError(
+                "Full session data could not be loaded."
+            ) from error
 
     def get_session_preview(
         self,
@@ -155,11 +254,11 @@ class FastF1Provider(TimingDataProvider):
         )
 
     def load_laps_session(
-            self,
-            *,
-            year: int,
-            event_name: str,
-            session_identifier: str,
+        self,
+        *,
+        year: int,
+        event_name: str,
+        session_identifier: str,
     ):
         try:
             session = fastf1.get_session(
@@ -183,11 +282,11 @@ class FastF1Provider(TimingDataProvider):
             ) from error
 
     def load_telemetry_session(
-            self,
-            *,
-            year: int,
-            event_name: str,
-            session_identifier: str,
+        self,
+        *,
+        year: int,
+        event_name: str,
+        session_identifier: str,
     ):
         try:
             session = fastf1.get_session(
@@ -211,11 +310,11 @@ class FastF1Provider(TimingDataProvider):
             ) from error
 
     def load_results_session(
-            self,
-            *,
-            year: int,
-            event_name: str,
-            session_identifier: str,
+        self,
+        *,
+        year: int,
+        event_name: str,
+        session_identifier: str,
     ):
         try:
             session = fastf1.get_session(

@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.exceptions import install_exception_handlers
+from app.core.logging import RequestLoggingMiddleware, configure_logging
 from app.core.redis import (
     RedisUnavailableError,
     create_redis_client,
@@ -14,10 +15,7 @@ from app.core.redis import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+configure_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +29,7 @@ async def lifespan(app: FastAPI):
         await ensure_redis_available(redis)
         logger.info("Redis is connected.")
     except RedisUnavailableError as error:
-        logger.warning("Redis is not ready: %s", error)
+        logger.warning("Redis is not ready error_type=%s.", type(error).__name__)
 
     logger.info(
         "%s is starting in %s mode",
@@ -55,6 +53,15 @@ app = FastAPI(
     ),
     debug=settings.debug,
     lifespan=lifespan,
+    swagger_ui_init_oauth=(
+        {
+            "clientId": settings.keycloak_swagger_client_id,
+            "usePkceWithAuthorizationCodeGrant": True,
+            "scopes": "openid profile email",
+        }
+        if settings.keycloak_swagger_configured
+        else None
+    ),
 )
 
 app.add_middleware(
@@ -64,6 +71,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 install_exception_handlers(app)
 

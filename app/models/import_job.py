@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -26,12 +27,19 @@ class DataSource(str, Enum):
 class ImportJobStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
+    CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
 
 class ImportJob(Base):
     __tablename__ = "import_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_import_jobs_idempotency_key",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
 
@@ -63,6 +71,16 @@ class ImportJob(Base):
     )
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    durable_job_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("durable_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

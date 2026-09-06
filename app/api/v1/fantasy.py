@@ -5,6 +5,7 @@ from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -19,13 +20,20 @@ from app.core.redis import (
     RedisUnavailableError,
     ensure_redis_available,
 )
+from app.core.rate_limit import expensive_request_rate_limit
 from app.core.security import (
     AuthenticatedUser,
+    authenticate_access_token,
+    ensure_active_profile,
     require_roles,
 )
-from app.db.database import get_db
+from app.db.database import SessionLocal, get_db
+from app.models.durable_job import DurableJobType
+from app.schemas.durable_job import DurableJobResponse
 from app.schemas.fantasy import (
     FantasyCommunityResponse,
+    FantasyDashboardResponse,
+    FantasyEntryProgressResponse,
     FantasyFinalizeResponse,
     FantasyGroupCreateRequest,
     FantasyGroupDetailResponse,
@@ -38,12 +46,15 @@ from app.schemas.fantasy import (
     FantasyPredictionUpdateRequest,
     FantasyQuestionResolutionRequest,
     FantasyQuestionResolutionResponse,
+    FantasyQuestionSaveRequest,
+    FantasyQuestionSaveResponse,
     FantasyRaceSummaryResponse,
     FantasyScoreRunResponse,
 )
 from app.services.fantasy_event_service import (
     publish_fantasy_event,
 )
+from app.services.job_dispatch_service import enqueue_job
 from app.services.fantasy_service import (
     FantasyCommunityPrivacyError,
     FantasyError,
@@ -82,6 +93,25 @@ def list_fantasy_races(
 
 
 @router.get(
+    "/me/dashboard",
+    response_model=FantasyDashboardResponse,
+    summary="Get the current fan's Fantasy dashboard",
+)
+def get_fantasy_dashboard(
+    year: int | None = Query(default=None, ge=1950, le=2100),
+    current_user: AuthenticatedUser = Depends(
+        require_roles("fan")
+    ),
+    db: Session = Depends(get_db),
+) -> FantasyDashboardResponse:
+    profile_id = _profile_id(db, current_user)
+    return FantasyService(db).get_dashboard(
+        user_profile_id=profile_id,
+        year=year,
+    )
+
+
+@router.get(
     "/races/{race_session_id}/prediction",
     response_model=FantasyPredictionResponse,
     summary="Get the current user's Fantasy prediction bundle",
@@ -96,6 +126,28 @@ def get_prediction(
     try:
         profile_id = _profile_id(db, current_user)
         return FantasyService(db).get_prediction(
+            profile_id,
+            race_session_id,
+        )
+    except FantasyError as error:
+        raise _fantasy_http_error(error) from error
+
+
+@router.get(
+    "/races/{race_session_id}/entry",
+    response_model=FantasyEntryProgressResponse,
+    summary="Get the current user's Fantasy weekend entry progress",
+)
+def get_entry_progress(
+    race_session_id: UUID,
+    current_user: AuthenticatedUser = Depends(
+        require_roles("fan")
+    ),
+    db: Session = Depends(get_db),
+) -> FantasyEntryProgressResponse:
+    try:
+        profile_id = _profile_id(db, current_user)
+        return FantasyService(db).get_entry_progress(
             profile_id,
             race_session_id,
         )
@@ -122,6 +174,32 @@ def save_prediction(
             profile_id,
             race_session_id,
             payload,
+        )
+    except FantasyError as error:
+        raise _fantasy_http_error(error) from error
+
+
+@router.put(
+    "/races/{race_session_id}/questions/{question_key}",
+    response_model=FantasyQuestionSaveResponse,
+    summary="Save or clear one Fantasy question without changing others",
+)
+def save_question(
+    race_session_id: UUID,
+    question_key: str,
+    payload: FantasyQuestionSaveRequest,
+    current_user: AuthenticatedUser = Depends(
+        require_roles("fan")
+    ),
+    db: Session = Depends(get_db),
+) -> FantasyQuestionSaveResponse:
+    try:
+        profile_id = _profile_id(db, current_user)
+        return FantasyService(db).save_question(
+            user_profile_id=profile_id,
+            race_session_id=race_session_id,
+            question_key=question_key,
+            payload=payload,
         )
     except FantasyError as error:
         raise _fantasy_http_error(error) from error
@@ -160,6 +238,7 @@ def score_questions(
     race_session_id: UUID,
     background_tasks: BackgroundTasks,
     request: Request,
+    _: None = Depends(expensive_request_rate_limit),
     current_user: AuthenticatedUser = Depends(
         require_roles("editor")
     ),
@@ -188,6 +267,37 @@ def score_questions(
         return response
     except FantasyError as error:
         raise _fantasy_http_error(error) from error
+
+
+@router.post(
+    "/races/{race_session_id}/scoring-jobs",
+    response_model=DurableJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue idempotent Fantasy scoring",
+)
+def queue_fantasy_scoring(
+    race_session_id: UUID,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
+    db: Session = Depends(get_db),
+) -> DurableJobResponse:
+    del current_user
+    return enqueue_job(
+        db,
+        job_type=DurableJobType.FANTASY_SCORE,
+        target_id=race_session_id,
+        idempotency_key=(
+            f"fantasy-score:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"race_session_id": str(race_session_id)},
+    )
 
 
 @router.put(
@@ -238,6 +348,7 @@ def finalize_weekend(
     race_session_id: UUID,
     background_tasks: BackgroundTasks,
     request: Request,
+    _: None = Depends(expensive_request_rate_limit),
     current_user: AuthenticatedUser = Depends(
         require_roles("editor")
     ),
@@ -263,6 +374,37 @@ def finalize_weekend(
         return response
     except FantasyError as error:
         raise _fantasy_http_error(error) from error
+
+
+@router.post(
+    "/races/{race_session_id}/finalization-jobs",
+    response_model=DurableJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue idempotent Fantasy weekend finalization",
+)
+def queue_fantasy_finalization(
+    race_session_id: UUID,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
+    db: Session = Depends(get_db),
+) -> DurableJobResponse:
+    del current_user
+    return enqueue_job(
+        db,
+        job_type=DurableJobType.FANTASY_FINALIZE,
+        target_id=race_session_id,
+        idempotency_key=(
+            f"fantasy-finalize:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"race_session_id": str(race_session_id)},
+    )
 
 
 @router.get(
@@ -463,6 +605,12 @@ async def stream_fantasy_updates(
     websocket: WebSocket,
     race_session_id: UUID,
 ) -> None:
+    from starlette.concurrency import run_in_threadpool
+
+    if not await run_in_threadpool(_is_authorized_fantasy_stream, websocket):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
     try:
@@ -493,6 +641,25 @@ async def stream_fantasy_updates(
         )
     except WebSocketDisconnect:
         return
+
+
+def _is_authorized_fantasy_stream(websocket: WebSocket) -> bool:
+    authorization = websocket.headers.get("authorization")
+    scheme, _, access_token = (authorization or "").partition(" ")
+
+    if scheme.casefold() != "bearer" or not access_token.strip():
+        return False
+
+    db = SessionLocal()
+    try:
+        user = authenticate_access_token(access_token.strip())
+        ensure_active_profile(user, db)
+        UserProfileService(db).get_or_create_profile(user)
+        return user.has_role("fan")
+    except HTTPException:
+        return False
+    finally:
+        db.close()
 
 
 def _profile_id(

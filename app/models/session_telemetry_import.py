@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -23,6 +24,7 @@ from app.db.base import Base
 class SessionTelemetryImportStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
+    CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
@@ -44,6 +46,10 @@ class SessionTelemetryImport(Base):
             "idx_session_telemetry_imports_session_status",
             "race_session_id",
             "status",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_session_telemetry_imports_idempotency_key",
         ),
     )
 
@@ -79,10 +85,9 @@ class SessionTelemetryImport(Base):
         nullable=True,
     )
 
-    max_laps_per_driver: Mapped[int] = mapped_column(
+    max_laps_per_driver: Mapped[int | None] = mapped_column(
         Integer,
-        nullable=False,
-        default=6,
+        nullable=True,
     )
 
     clean_laps_only: Mapped[bool] = mapped_column(
@@ -172,6 +177,16 @@ class SessionTelemetryImport(Base):
     error_message: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    durable_job_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("durable_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     started_at: Mapped[datetime | None] = mapped_column(

@@ -1,0 +1,22 @@
+# Keep credentials, local caches, and development-only artifacts out of the
+# Docker build context. The application image only needs its runtime source
+# and migration files.
+.git
+.idea
+.agents
+.codex
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+*.sqlite
+.env
+.env.*
+data
+flutter_app
+tests
+docs
+infra
+scripts
+*.md

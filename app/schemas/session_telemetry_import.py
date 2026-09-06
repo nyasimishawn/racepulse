@@ -18,7 +18,10 @@ class SessionTelemetryImportCreate(BaseModel):
             "with imported laps in the session."
         ),
     )
-    max_laps_per_driver: int = Field(default=6, ge=1, le=25)
+    max_laps_per_driver: int | None = Field(
+        default=6, ge=1, le=25,
+        description="Null imports all laps; full weekends use null.",
+    )
     clean_laps_only: bool = True
 
     @field_validator("driver_numbers")
@@ -84,7 +87,7 @@ class SessionTelemetryImportResponse(BaseModel):
     status: SessionTelemetryImportStatus
 
     requested_driver_numbers: list[str] | None
-    max_laps_per_driver: int
+    max_laps_per_driver: int | None
     clean_laps_only: bool
     driver_results: list[SessionTelemetryImportDriverResponse]
 
@@ -106,6 +109,7 @@ class SessionTelemetryImportResponse(BaseModel):
 
     current_driver_number: str | None
     error_message: str | None
+    durable_job_id: UUID | None
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime

@@ -1,6 +1,4 @@
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
-
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -126,4 +124,40 @@ def test_fantasy_prediction_and_community_routes(
     assert (
         community_response.json()["options"][0]["option_id"]
         == str(driver.id)
+    )
+
+
+def test_fantasy_v2_dashboard_and_single_question_save_routes(
+    fantasy_client: TestClient,
+    db_session: Session,
+) -> None:
+    race, driver, _ = seed_future_race(db_session)
+
+    save_response = fantasy_client.put(
+        f"/api/v1/fantasy/races/{race.id}/questions/RACE_P1",
+        json={"driver_id": str(driver.id)},
+    )
+
+    assert save_response.status_code == 200
+    saved = save_response.json()
+    assert saved["question"]["key"] == "RACE_P1"
+    assert saved["question"]["is_answered"] is True
+    assert saved["entry"]["status"] == "IN_PROGRESS"
+
+    entry_response = fantasy_client.get(
+        f"/api/v1/fantasy/races/{race.id}/entry"
+    )
+
+    assert entry_response.status_code == 200
+    assert entry_response.json()["answered_question_count"] == 1
+
+    dashboard_response = fantasy_client.get(
+        "/api/v1/fantasy/me/dashboard?year=2026"
+    )
+
+    assert dashboard_response.status_code == 200
+    dashboard = dashboard_response.json()
+    assert dashboard["season_year"] == 2026
+    assert dashboard["entries"][0]["race"]["race_session_id"] == str(
+        race.id
     )

@@ -81,6 +81,40 @@ class FantasyPredictionUpdateRequest(BaseModel):
         return self
 
 
+class FantasyQuestionSaveRequest(BaseModel):
+    driver_id: UUID | None = None
+    team_id: UUID | None = None
+    driver_ids: list[UUID] | None = Field(default=None, max_length=2)
+    clear: bool = False
+
+    @field_validator("driver_ids")
+    @classmethod
+    def validate_driver_ids(
+        cls,
+        value: list[UUID] | None,
+    ) -> list[UUID] | None:
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("Driver selections must be unique.")
+
+        return value
+
+    @model_validator(mode="after")
+    def validate_clear_request(self) -> "FantasyQuestionSaveRequest":
+        if self.clear and any(
+            value is not None
+            for value in (
+                self.driver_id,
+                self.team_id,
+                self.driver_ids,
+            )
+        ):
+            raise ValueError(
+                "A Fantasy question cannot be cleared and answered together."
+            )
+
+        return self
+
+
 class FantasyQuestionResolutionRequest(BaseModel):
     status: Literal["RESOLVED", "NOT_SCORED"]
     actual_driver_id: UUID | None = None
@@ -210,6 +244,14 @@ class FantasyQuestionResponse(BaseModel):
     selection_limit: int
     answer: FantasyPredictionAnswerResponse | None
     resolution: FantasyQuestionResolutionResponse | None
+    status: Literal[
+        "OPEN",
+        "LOCKED",
+        "UNAVAILABLE",
+        "RESOLVED",
+        "NOT_SCORED",
+    ] = "OPEN"
+    is_answered: bool = False
 
 
 class FantasyDriverOptionResponse(BaseModel):
@@ -243,6 +285,36 @@ class FantasyPredictionResponse(BaseModel):
     questions: list[FantasyQuestionResponse]
     drivers: list[FantasyDriverOptionResponse]
     teams: list[FantasyTeamOptionResponse]
+
+
+class FantasyEntryProgressResponse(BaseModel):
+    prediction_id: UUID | None
+    race: FantasyRaceSummaryResponse
+    status: Literal[
+        "DRAFT",
+        "IN_PROGRESS",
+        "COMPLETE",
+        "LOCKED",
+        "SCORING",
+        "SCORED",
+        "FINALIZED",
+    ]
+    total_points: int
+    total_question_count: int
+    answered_question_count: int
+    locked_question_count: int
+    resolved_question_count: int
+    scored_question_count: int
+    completion_percentage: float
+    next_deadline: datetime | None
+    personal_race_rank: int | None
+    personal_season_rank: int | None
+    questions: list[FantasyQuestionResponse]
+
+
+class FantasyQuestionSaveResponse(BaseModel):
+    entry: FantasyEntryProgressResponse
+    question: FantasyQuestionResponse
 
 
 class FantasyScoreRunResponse(BaseModel):
@@ -333,3 +405,12 @@ class FantasyCommunityResponse(BaseModel):
     total_predictions: int
     multiple_selection: bool
     options: list[FantasyCommunityOptionResponse]
+
+
+class FantasyDashboardResponse(BaseModel):
+    season_year: int
+    season_points: int
+    season_rank: int | None
+    next_deadline: datetime | None
+    entries: list[FantasyEntryProgressResponse]
+    groups: list[FantasyGroupSummaryResponse]

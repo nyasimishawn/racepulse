@@ -16,6 +16,8 @@ from app.core.redis import (
     ensure_redis_available,
     get_redis,
 )
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.schemas.replay_room import (
     CreateReplayRoomRequest,
     ReplayRoomCommandRequest,
@@ -47,8 +49,11 @@ router = APIRouter(
 )
 async def create_replay_room(
     request: CreateReplayRoomRequest,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     redis: Redis = Depends(get_redis),
 ) -> ReplayRoomResponse:
+    del current_user
     try:
         return await ReplayRoomService(redis).create_room(request)
 
@@ -114,8 +119,10 @@ async def get_replay_room_snapshot(
 async def command_replay_room(
     room_id: UUID,
     request: ReplayRoomCommandRequest,
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     redis: Redis = Depends(get_redis),
 ) -> ReplayRoomResponse:
+    del current_user
     try:
         return await ReplayRoomService(redis).command(
             room_id,

@@ -2,9 +2,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
+from app.models.fantasy import FantasyGroupWeekendEligibility, FantasyWeekendQuestion
 from app.models.lap import Lap
 from app.models.meeting import Meeting
 from app.models.race_session import RaceSession
@@ -17,6 +19,7 @@ from app.schemas.fantasy import (
     FantasyPredictionAnswerInput,
     FantasyPredictionUpdateRequest,
     FantasyQuestionResolutionRequest,
+    FantasyQuestionSaveRequest,
 )
 from app.services.fantasy_service import (
     FantasyPredictionLockedError,
@@ -371,3 +374,239 @@ def test_fantasy_prevents_changes_after_question_lock(
         )
 
     assert error.value.question_keys == ["RACE_P1"]
+
+
+def test_fantasy_v2_reuses_schedule_question_snapshots_and_saves_one_question(
+    db_session: Session,
+) -> None:
+    weekend = seed_fantasy_weekend(db_session)
+    base = weekend["base"]
+    fp1 = weekend["fp1"]
+    race = weekend["race"]
+    driver_a = weekend["driver_a"]
+    player_one = weekend["player_one"]
+
+    assert isinstance(base, datetime)
+    assert isinstance(fp1, RaceSession)
+    assert isinstance(race, RaceSession)
+    assert isinstance(driver_a, Driver)
+    assert isinstance(player_one, UserProfile)
+
+    before_weekend = FantasyService(db_session, now=base)
+    initial_entry = before_weekend.get_entry_progress(
+        player_one.id,
+        race.id,
+    )
+    question_keys = {question.key for question in initial_entry.questions}
+
+    assert initial_entry.status == "DRAFT"
+    assert "FP1_P1" in question_keys
+    assert "FP2_P1" not in question_keys
+    assert "FP3_P1" not in question_keys
+
+    fp1_snapshot = db_session.scalar(
+        select(FantasyWeekendQuestion).where(
+            FantasyWeekendQuestion.race_session_id == race.id,
+            FantasyWeekendQuestion.question_key == "FP1_P1",
+        )
+    )
+
+    assert fp1_snapshot is not None
+    original_lock = fp1_snapshot.locks_at
+    fp1.started_at = base + timedelta(days=10)
+    db_session.commit()
+
+    after_fp1 = FantasyService(
+        db_session,
+        now=base + timedelta(days=1, seconds=1),
+    )
+    saved = after_fp1.save_question(
+        user_profile_id=player_one.id,
+        race_session_id=race.id,
+        question_key="RACE_P1",
+        payload=FantasyQuestionSaveRequest(driver_id=driver_a.id),
+    )
+
+    assert saved.entry.status == "IN_PROGRESS"
+    assert saved.question.key == "RACE_P1"
+    assert saved.question.is_answered is True
+    assert saved.entry.next_deadline == base + timedelta(days=2)
+
+    persisted_snapshot = db_session.scalar(
+        select(FantasyWeekendQuestion).where(
+            FantasyWeekendQuestion.id == fp1_snapshot.id
+        )
+    )
+
+    assert persisted_snapshot is not None
+    assert persisted_snapshot.locks_at == original_lock
+
+    with pytest.raises(FantasyPredictionLockedError) as error:
+        after_fp1.save_question(
+            user_profile_id=player_one.id,
+            race_session_id=race.id,
+            question_key="FP1_P1",
+            payload=FantasyQuestionSaveRequest(driver_id=driver_a.id),
+        )
+
+    assert error.value.question_keys == ["FP1_P1"]
+
+
+def test_fantasy_group_eligibility_locks_at_first_question(
+    db_session: Session,
+) -> None:
+    weekend = seed_fantasy_weekend(db_session)
+    base = weekend["base"]
+    race = weekend["race"]
+    driver_a = weekend["driver_a"]
+    player_one = weekend["player_one"]
+    player_two = weekend["player_two"]
+
+    assert isinstance(base, datetime)
+    assert isinstance(race, RaceSession)
+    assert isinstance(driver_a, Driver)
+    assert isinstance(player_one, UserProfile)
+    assert isinstance(player_two, UserProfile)
+
+    before_weekend = FantasyService(db_session, now=base)
+    before_weekend.save_question(
+        user_profile_id=player_one.id,
+        race_session_id=race.id,
+        question_key="RACE_P1",
+        payload=FantasyQuestionSaveRequest(driver_id=driver_a.id),
+    )
+    group = before_weekend.create_group(
+        player_one.id,
+        FantasyGroupCreateRequest(name="Fair Play", max_members=2),
+    )
+
+    assert group.invite_code is not None
+
+    FantasyService(
+        db_session,
+        now=base + timedelta(days=1, seconds=1),
+    ).join_group(
+        player_two.id,
+        FantasyGroupJoinRequest(invite_code=group.invite_code),
+    )
+
+    after_race = FantasyService(
+        db_session,
+        now=base + timedelta(days=4),
+    )
+    after_race.score_available_questions(race.id)
+    after_race.set_question_resolution(
+        race_session_id=race.id,
+        question_key="RACE_DNF_DRIVERS",
+        payload=FantasyQuestionResolutionRequest(
+            status="NOT_SCORED",
+            source_reference="Official classification is inconclusive",
+        ),
+        resolved_by_profile_id=player_one.id,
+    )
+    after_race.finalize_weekend(race.id)
+
+    eligibility_rows = db_session.scalars(
+        select(FantasyGroupWeekendEligibility).where(
+            FantasyGroupWeekendEligibility.group_id == group.id,
+            FantasyGroupWeekendEligibility.race_session_id == race.id,
+        )
+    ).all()
+    podium = after_race.get_group_podium(
+        group_id=group.id,
+        race_session_id=race.id,
+        profile_id=player_one.id,
+    )
+
+    assert [row.user_profile_id for row in eligibility_rows] == [
+        player_one.id
+    ]
+    assert [row.display_name for row in podium.rows] == ["Player One"]
+
+
+def test_fantasy_correction_refinalizes_existing_group_podium(
+    db_session: Session,
+) -> None:
+    weekend = seed_fantasy_weekend(db_session)
+    base = weekend["base"]
+    race = weekend["race"]
+    driver_a = weekend["driver_a"]
+    driver_c = weekend["driver_c"]
+    player_one = weekend["player_one"]
+    player_two = weekend["player_two"]
+
+    assert isinstance(base, datetime)
+    assert isinstance(race, RaceSession)
+    assert isinstance(driver_a, Driver)
+    assert isinstance(driver_c, Driver)
+    assert isinstance(player_one, UserProfile)
+    assert isinstance(player_two, UserProfile)
+
+    before_weekend = FantasyService(db_session, now=base)
+    before_weekend.save_question(
+        user_profile_id=player_one.id,
+        race_session_id=race.id,
+        question_key="RACE_FASTEST_LAP",
+        payload=FantasyQuestionSaveRequest(driver_id=driver_c.id),
+    )
+    before_weekend.save_question(
+        user_profile_id=player_two.id,
+        race_session_id=race.id,
+        question_key="RACE_FASTEST_LAP",
+        payload=FantasyQuestionSaveRequest(driver_id=driver_a.id),
+    )
+    group = before_weekend.create_group(
+        player_one.id,
+        FantasyGroupCreateRequest(name="Correction Check", max_members=2),
+    )
+
+    assert group.invite_code is not None
+
+    before_weekend.join_group(
+        player_two.id,
+        FantasyGroupJoinRequest(invite_code=group.invite_code),
+    )
+
+    after_race = FantasyService(
+        db_session,
+        now=base + timedelta(days=4),
+    )
+    after_race.score_available_questions(race.id)
+    after_race.set_question_resolution(
+        race_session_id=race.id,
+        question_key="RACE_DNF_DRIVERS",
+        payload=FantasyQuestionResolutionRequest(
+            status="NOT_SCORED",
+            source_reference="No reliable public DNF classification",
+        ),
+        resolved_by_profile_id=player_one.id,
+    )
+    after_race.finalize_weekend(race.id)
+
+    initial_podium = after_race.get_group_podium(
+        group_id=group.id,
+        race_session_id=race.id,
+        profile_id=player_one.id,
+    )
+
+    assert initial_podium.rows[0].display_name == "Player One"
+
+    after_race.set_question_resolution(
+        race_session_id=race.id,
+        question_key="RACE_FASTEST_LAP",
+        payload=FantasyQuestionResolutionRequest(
+            status="RESOLVED",
+            actual_driver_id=driver_a.id,
+            source_reference="Official timing correction",
+        ),
+        resolved_by_profile_id=player_one.id,
+    )
+
+    corrected_podium = after_race.get_group_podium(
+        group_id=group.id,
+        race_session_id=race.id,
+        profile_id=player_one.id,
+    )
+
+    assert corrected_podium.rows[0].display_name == "Player Two"
+    assert corrected_podium.rows[0].points == 5

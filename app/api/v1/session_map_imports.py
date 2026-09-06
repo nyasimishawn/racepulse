@@ -1,9 +1,13 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.db.database import get_db
+from app.models.durable_job import DurableJobType
+from app.models.session_map_import import SessionMapImport
 from app.schemas.session_map_import import (
     SessionMapCoverageResponse,
     SessionMapImportCreate,
@@ -17,6 +21,7 @@ from app.services.session_map_import_service import (
     SessionMapImportStateError,
     SessionMapSourceSessionNotFoundError,
 )
+from app.services.job_dispatch_service import enqueue_job
 
 
 session_router = APIRouter(tags=["Session Map Imports"])
@@ -35,13 +40,23 @@ job_router = APIRouter(
 def create_map_import(
     race_session_id: UUID,
     payload: SessionMapImportCreate,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> SessionMapImportResponse:
+    del current_user
     try:
-        return SessionMapImportService(db).create(
+        map_import = SessionMapImportService(db).create(
             race_session_id=race_session_id,
             payload=payload,
+            idempotency_key=idempotency_key,
         )
+        return _queue_map_import(db, map_import, idempotency_key)
 
     except SessionMapSourceSessionNotFoundError as error:
         raise HTTPException(
@@ -84,8 +99,10 @@ def get_map_coverage(
 )
 def get_map_import(
     map_import_id: UUID,
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> SessionMapImportResponse:
+    del current_user
     try:
         return SessionMapImportService(db).get(map_import_id)
 
@@ -103,8 +120,10 @@ def get_map_import(
 )
 def get_map_import_drivers(
     map_import_id: UUID,
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> list[SessionMapImportDriverResponse]:
+    del current_user
     try:
         return SessionMapImportService(db).list_drivers(
             map_import_id
@@ -124,10 +143,18 @@ def get_map_import_drivers(
 )
 def run_map_import(
     map_import_id: UUID,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> SessionMapImportResponse:
+    del current_user
     try:
-        return SessionMapImportService(db).run(map_import_id)
+        map_import = SessionMapImportService(db).get(map_import_id)
+        return _queue_map_import(
+            db,
+            map_import,
+            map_import.idempotency_key,
+        )
 
     except SessionMapImportNotFoundError as error:
         raise HTTPException(
@@ -146,3 +173,26 @@ def run_map_import(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(error),
         ) from error
+
+
+def _queue_map_import(
+    db: Session,
+    map_import: SessionMapImport,
+    idempotency_key: str | None,
+) -> SessionMapImport:
+    durable_job = enqueue_job(
+        db,
+        job_type=DurableJobType.SESSION_MAP_IMPORT,
+        target_id=map_import.id,
+        idempotency_key=(
+            f"session-map-import:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"map_import_id": str(map_import.id)},
+    )
+    if map_import.durable_job_id != durable_job.id:
+        map_import.durable_job_id = durable_job.id
+        db.commit()
+        db.refresh(map_import)
+    return map_import

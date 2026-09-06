@@ -1,17 +1,8 @@
 import asyncio
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from redis.asyncio import Redis
-from sqlalchemy import func, select
-
-from app.models.session_map_import import (
-    SessionMapDriverStatus,
-    SessionMapImport,
-    SessionMapImportStatus,
-)
-from app.models.session_map_import_driver import (
-    SessionMapImportDriver,
-)
+from sqlalchemy import select
 
 from app.db.database import SessionLocal
 from app.models.driver import Driver
@@ -48,7 +39,7 @@ class ReplayRoomMapService:
         ):
             return None
 
-        interval_ms = room.map_sample_interval_ms
+        interval_ms = room.map_sample_interval_ms or 250
 
         bucket_cursor_ms = min(
             room.duration_ms,

@@ -34,6 +34,24 @@ class FantasyQuestionResolutionStatus(str, Enum):
     NOT_SCORED = "NOT_SCORED"
 
 
+class FantasyEntryStatus(str, Enum):
+    DRAFT = "DRAFT"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETE = "COMPLETE"
+    LOCKED = "LOCKED"
+    SCORING = "SCORING"
+    SCORED = "SCORED"
+    FINALIZED = "FINALIZED"
+
+
+class FantasyWeekendQuestionStatus(str, Enum):
+    OPEN = "OPEN"
+    LOCKED = "LOCKED"
+    UNAVAILABLE = "UNAVAILABLE"
+    RESOLVED = "RESOLVED"
+    NOT_SCORED = "NOT_SCORED"
+
+
 class FantasyPrediction(Base):
     __tablename__ = "fantasy_predictions"
     __table_args__ = (
@@ -60,6 +78,34 @@ class FantasyPrediction(Base):
         ForeignKey("race_sessions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+    status: Mapped[FantasyEntryStatus] = mapped_column(
+        SqlEnum(
+            FantasyEntryStatus,
+            name="fantasy_entry_status",
+        ),
+        default=FantasyEntryStatus.DRAFT,
+        nullable=False,
+    )
+    first_lock_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_lock_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    scored_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -278,6 +324,72 @@ class FantasyQuestionResolution(Base):
     )
 
 
+class FantasyWeekendQuestion(Base):
+    __tablename__ = "fantasy_weekend_questions"
+    __table_args__ = (
+        UniqueConstraint(
+            "race_session_id",
+            "question_key",
+            name="uq_fantasy_weekend_question",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid,
+        primary_key=True,
+        default=uuid4,
+    )
+    race_session_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("race_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    question_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    category: Mapped[str] = mapped_column(String(20), nullable=False)
+    answer_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_session_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("race_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_session_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    locks_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    max_points: Mapped[int] = mapped_column(Integer, nullable=False)
+    selection_limit: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        nullable=False,
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[FantasyWeekendQuestionStatus] = mapped_column(
+        SqlEnum(
+            FantasyWeekendQuestionStatus,
+            name="fantasy_weekend_question_status",
+        ),
+        default=FantasyWeekendQuestionStatus.UNAVAILABLE,
+        nullable=False,
+    )
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class FantasyGroup(Base):
     __tablename__ = "fantasy_groups"
     __table_args__ = (
@@ -422,5 +534,58 @@ class FantasyGroupWeekendResult(Base):
     )
     finalized_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        nullable=False,
+    )
+
+
+class FantasyGroupWeekendEligibility(Base):
+    __tablename__ = "fantasy_group_weekend_eligibilities"
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id",
+            "race_session_id",
+            "user_profile_id",
+            name="uq_fantasy_group_weekend_eligibility",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid,
+        primary_key=True,
+        default=uuid4,
+    )
+    group_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("fantasy_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    race_session_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("race_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_profile_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("user_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    membership_joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    first_question_locks_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    locked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
         nullable=False,
     )

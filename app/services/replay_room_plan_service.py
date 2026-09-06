@@ -127,7 +127,9 @@ class ReplayRoomPlanService:
                 "full_session_track_map_available": full_session_ready,
                 "map_import_id": str(candidate.id),
                 "map_driver_count": ready_driver_count,
-                "map_sample_interval_ms": candidate.sample_interval_ms,
+                # Raw downloads keep all points; replay still has a bounded
+                # display cadence independent of storage sampling.
+                "map_sample_interval_ms": candidate.sample_interval_ms or 250,
                 "map_time_alignment": (
                     "FASTF1_SESSION_TIME_MINUS_PLAN_ORIGIN"
                 ),

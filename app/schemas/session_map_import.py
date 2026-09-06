@@ -20,7 +20,10 @@ class SessionMapImportCreate(BaseModel):
         ),
     )
 
-    sample_interval_ms: Literal[250, 500, 1000] = 250
+    sample_interval_ms: Literal[0, 250, 500, 1000] = Field(
+        default=250,
+        description="0 preserves every usable provider position sample.",
+    )
 
     @field_validator("driver_numbers")
     @classmethod
@@ -76,6 +79,7 @@ class SessionMapImportResponse(BaseModel):
     samples_written: int
     current_driver_number: str | None
     error_message: str | None
+    durable_job_id: UUID | None
 
     started_at: datetime | None
     completed_at: datetime | None

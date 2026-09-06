@@ -8,7 +8,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.analytics.driver_consistency import (
-    DriverConsistency,
     calculate_driver_consistency,
 )
 from app.analytics.pace_analysis import (
@@ -22,7 +21,6 @@ from app.analytics.sector_analysis import (
     calculate_sector_deltas,
 )
 from app.analytics.tyre_degradation import (
-    TyrePaceProxy,
     estimate_tyre_pace_proxy,
 )
 from app.models.driver import Driver

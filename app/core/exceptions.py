@@ -91,9 +91,10 @@ async def handle_database_exception(
     request: Request,
     error: SQLAlchemyError,
 ) -> ORJSONResponse:
-    logger.exception(
-        "Database request failed for %s",
+    logger.error(
+        "Database request failed path=%s error_type=%s",
         request.url.path,
+        type(error).__name__,
     )
 
     return _error_response(
@@ -107,9 +108,10 @@ async def handle_unexpected_exception(
     request: Request,
     error: Exception,
 ) -> ORJSONResponse:
-    logger.exception(
-        "Unexpected request failure for %s",
+    logger.error(
+        "Unexpected request failure path=%s error_type=%s",
         request.url.path,
+        type(error).__name__,
     )
 
     return _error_response(

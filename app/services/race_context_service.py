@@ -54,25 +54,25 @@ class RaceContextService:
     def import_context(
         self,
         race_session_id: UUID,
+        *,
+        loaded_session=None,
     ) -> RaceContextImportResponse:
-        race_session, meeting = self._load_source_context(
-            race_session_id
-        )
+        race_session, meeting = self._load_source_context(race_session_id)
 
         try:
-            fastf1_session = self.fastf1_provider.load_context_session(
-                year=meeting.year,
-                event_name=meeting.name,
-                session_identifier=race_session.session_identifier,
-            )
+            fastf1_session = loaded_session
+            if fastf1_session is None:
+                fastf1_session = self.fastf1_provider.load_context_session(
+                    year=meeting.year,
+                    event_name=meeting.name,
+                    session_identifier=race_session.session_identifier,
+                )
         except Exception as error:
             raise RaceContextImportError(
                 "FastF1 could not load weather and race-control data."
             ) from error
 
-        session_clock_anchor = self._get_session_clock_anchor(
-            race_session_id
-        )
+        session_clock_anchor = self._get_session_clock_anchor(race_session_id)
 
         weather_samples = self._normalise_weather(
             race_session_id=race_session_id,
@@ -113,9 +113,7 @@ class RaceContextService:
                 "Race context data could not be saved."
             ) from error
 
-        pit_events_available = len(
-            self._build_pit_events(race_session_id)
-        )
+        pit_events_available = len(self._build_pit_events(race_session_id))
 
         aligned = session_clock_anchor is not None
 
@@ -170,10 +168,7 @@ class RaceContextService:
 
         samples = self.db.scalars(statement).all()
 
-        return [
-            self._to_weather_response(sample)
-            for sample in samples
-        ]
+        return [self._to_weather_response(sample) for sample in samples]
 
     def list_race_control(
         self,
@@ -217,10 +212,7 @@ class RaceContextService:
 
         events = self.db.scalars(statement).all()
 
-        return [
-            self._to_race_control_response(event)
-            for event in events
-        ]
+        return [self._to_race_control_response(event) for event in events]
 
     def list_pit_events(
         self,
@@ -270,9 +262,7 @@ class RaceContextService:
                 start_ms=start_ms,
                 end_ms=end_ms,
             ):
-                timeline.append(
-                    self._timeline_from_race_control(event)
-                )
+                timeline.append(self._timeline_from_race_control(event))
 
         if (
             TimelineEventType.PIT_ENTRY in selected_types
@@ -305,11 +295,9 @@ class RaceContextService:
         timeline.sort(key=self._timeline_sort_key)
 
         total = len(timeline)
-        paged_events = timeline[offset:offset + limit]
+        paged_events = timeline[offset : offset + limit]
 
-        session_clock_anchor = self._get_session_clock_anchor(
-            race_session_id
-        )
+        session_clock_anchor = self._get_session_clock_anchor(race_session_id)
 
         warnings: list[str] = []
 
@@ -348,9 +336,7 @@ class RaceContextService:
         ).one_or_none()
 
         if row is None:
-            raise RaceContextSessionNotFoundError(
-                "Race session not found."
-            )
+            raise RaceContextSessionNotFoundError("Race session not found.")
 
         race_session, meeting = row
 
@@ -360,9 +346,7 @@ class RaceContextService:
         race_session = self.db.get(RaceSession, race_session_id)
 
         if race_session is None:
-            raise RaceContextSessionNotFoundError(
-                "Race session not found."
-            )
+            raise RaceContextSessionNotFoundError("Race session not found.")
 
         return race_session
 
@@ -393,9 +377,7 @@ class RaceContextService:
         if absolute_start is None or lap_start_time_ms is None:
             return None
 
-        return absolute_start - timedelta(
-            milliseconds=int(lap_start_time_ms)
-        )
+        return absolute_start - timedelta(milliseconds=int(lap_start_time_ms))
 
     def _normalise_weather(
         self,
@@ -422,8 +404,7 @@ class RaceContextService:
                 continue
 
             occurred_at = (
-                session_clock_anchor
-                + timedelta(milliseconds=session_time_ms)
+                session_clock_anchor + timedelta(milliseconds=session_time_ms)
                 if session_clock_anchor is not None
                 else None
             )
@@ -434,22 +415,15 @@ class RaceContextService:
                 session_time_ms=session_time_ms,
                 occurred_at=occurred_at,
                 air_temperature_c=self._decimal(row.get("AirTemp")),
-                track_temperature_c=self._decimal(
-                    row.get("TrackTemp")
-                ),
+                track_temperature_c=self._decimal(row.get("TrackTemp")),
                 humidity_percent=self._decimal(row.get("Humidity")),
                 pressure_hpa=self._decimal(row.get("Pressure")),
                 rainfall=self._boolean(row.get("Rainfall")),
                 wind_speed_mps=self._decimal(row.get("WindSpeed")),
-                wind_direction_deg=self._integer(
-                    row.get("WindDirection")
-                ),
+                wind_direction_deg=self._integer(row.get("WindDirection")),
             )
 
-        return [
-            samples_by_time[time]
-            for time in sorted(samples_by_time)
-        ]
+        return [samples_by_time[time] for time in sorted(samples_by_time)]
 
     def _normalise_race_control_events(
         self,
@@ -493,9 +467,7 @@ class RaceContextService:
                     flag=self._text(row.get("Flag")),
                     scope=self._text(row.get("Scope")),
                     sector_number=self._integer(row.get("Sector")),
-                    driver_number=self._text(
-                        row.get("RacingNumber")
-                    ),
+                    driver_number=self._text(row.get("RacingNumber")),
                     lap_number=self._integer(row.get("Lap")),
                 )
             )
@@ -522,9 +494,7 @@ class RaceContextService:
             )
 
         rows = self.db.execute(statement).all()
-        session_clock_anchor = self._get_session_clock_anchor(
-            race_session_id
-        )
+        session_clock_anchor = self._get_session_clock_anchor(race_session_id)
 
         grouped: dict[UUID, tuple[Driver, list[Lap]]] = {}
 
@@ -584,8 +554,7 @@ class RaceContextService:
                     continue
 
                 duration_ms = (
-                    event["session_time_ms"]
-                    - active_entry["session_time_ms"]
+                    event["session_time_ms"] - active_entry["session_time_ms"]
                 )
 
                 active_entry["paired_event_id"] = event["event_id"]
@@ -598,9 +567,7 @@ class RaceContextService:
                     active_entry["data_quality_flags"].append(
                         "NON_POSITIVE_DURATION"
                     )
-                    event["data_quality_flags"].append(
-                        "NON_POSITIVE_DURATION"
-                    )
+                    event["data_quality_flags"].append("NON_POSITIVE_DURATION")
 
                 active_entry = None
 
@@ -613,18 +580,12 @@ class RaceContextService:
             drafts = [
                 draft
                 for draft in drafts
-                if not (
-                    set(draft["data_quality_flags"])
-                    & UNPAIRED_PIT_FLAGS
-                )
+                if not (set(draft["data_quality_flags"]) & UNPAIRED_PIT_FLAGS)
             ]
 
         drafts.sort(key=self._pit_event_sort_key)
 
-        return [
-            PitEventResponse(**draft)
-            for draft in drafts
-        ]
+        return [PitEventResponse(**draft) for draft in drafts]
 
     def _pit_event_draft(
         self,
@@ -636,9 +597,7 @@ class RaceContextService:
         session_clock_anchor: datetime | None,
     ) -> dict[str, Any]:
         action = (
-            "entry"
-            if event_type == TimelineEventType.PIT_ENTRY
-            else "exit"
+            "entry" if event_type == TimelineEventType.PIT_ENTRY else "exit"
         )
 
         occurred_at = self._pit_occurred_at(
@@ -676,14 +635,9 @@ class RaceContextService:
     ) -> datetime | None:
         lap_start_at = self._as_utc(lap.lap_start_at)
 
-        if (
-            lap_start_at is not None
-            and lap.lap_start_time_ms is not None
-        ):
+        if lap_start_at is not None and lap.lap_start_time_ms is not None:
             return lap_start_at + timedelta(
-                milliseconds=(
-                    session_time_ms - lap.lap_start_time_ms
-                )
+                milliseconds=(session_time_ms - lap.lap_start_time_ms)
             )
 
         if session_clock_anchor is not None:
@@ -702,12 +656,8 @@ class RaceContextService:
             source=sample.source,
             session_time_ms=sample.session_time_ms,
             occurred_at=sample.occurred_at,
-            air_temperature_c=self._float(
-                sample.air_temperature_c
-            ),
-            track_temperature_c=self._float(
-                sample.track_temperature_c
-            ),
+            air_temperature_c=self._float(sample.air_temperature_c),
+            track_temperature_c=self._float(sample.track_temperature_c),
             humidity_percent=self._float(sample.humidity_percent),
             pressure_hpa=self._float(sample.pressure_hpa),
             rainfall=sample.rainfall,
@@ -813,14 +763,10 @@ class RaceContextService:
         parts: list[str] = []
 
         if sample.track_temperature_c is not None:
-            parts.append(
-                f"Track {sample.track_temperature_c:.1f}°C"
-            )
+            parts.append(f"Track {sample.track_temperature_c:.1f}°C")
 
         if sample.air_temperature_c is not None:
-            parts.append(
-                f"Air {sample.air_temperature_c:.1f}°C"
-            )
+            parts.append(f"Air {sample.air_temperature_c:.1f}°C")
 
         if sample.rainfall is True:
             parts.append("Rain detected")
@@ -870,11 +816,7 @@ class RaceContextService:
         if "RED" in text or "SESSION STOPPED" in text:
             return "CRITICAL"
 
-        if (
-            "YELLOW" in text
-            or "SAFETY CAR" in text
-            or "VSC" in text
-        ):
+        if "YELLOW" in text or "SAFETY CAR" in text or "VSC" in text:
             return "WARNING"
 
         return "INFO"
@@ -906,9 +848,7 @@ class RaceContextService:
         event: dict[str, Any],
     ) -> tuple[int, int, str, str]:
         type_rank = (
-            0
-            if event["event_type"] == TimelineEventType.PIT_ENTRY
-            else 1
+            0 if event["event_type"] == TimelineEventType.PIT_ENTRY else 1
         )
 
         return (
@@ -940,11 +880,7 @@ class RaceContextService:
         start_ms: int | None,
         end_ms: int | None,
     ) -> None:
-        if (
-            start_ms is not None
-            and end_ms is not None
-            and start_ms > end_ms
-        ):
+        if start_ms is not None and end_ms is not None and start_ms > end_ms:
             raise RaceContextValidationError(
                 "start_ms cannot be greater than end_ms."
             )
@@ -958,11 +894,7 @@ class RaceContextService:
             return None
 
         return int(
-            round(
-                (occurred_at - session_clock_anchor)
-                .total_seconds()
-                * 1000
-            )
+            round((occurred_at - session_clock_anchor).total_seconds() * 1000)
         )
 
     @staticmethod

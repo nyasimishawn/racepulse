@@ -1,0 +1,124 @@
+name: racepulse
+
+x-racepulse-app: &racepulse-app
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: racepulse-api:local
+  init: true
+  environment: &racepulse-environment
+    APP_NAME: '${APP_NAME:-RacePulse API}'
+    ENVIRONMENT: ${ENVIRONMENT:-development}
+    DEBUG: ${DEBUG:-false}
+    DATABASE_URL: '${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-racepulse}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your environment}@postgres:5432/${POSTGRES_DB:-racepulse}}'
+    REDIS_URL: redis://redis:6379/0
+    FASTF1_CACHE_PATH: /var/lib/racepulse/fastf1-cache
+    FASTF1_VERIFY_SSL: ${FASTF1_VERIFY_SSL:-true}
+    KEYCLOAK_ENABLED: ${KEYCLOAK_ENABLED:-false}
+    KEYCLOAK_GROUPS_CLAIM: ${KEYCLOAK_GROUPS_CLAIM:-groups}
+    KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-}
+    KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-}
+    KEYCLOAK_SWAGGER_CLIENT_ID: ${KEYCLOAK_SWAGGER_CLIENT_ID:-}
+    KEYCLOAK_CLOCK_SKEW_SECONDS: ${KEYCLOAK_CLOCK_SKEW_SECONDS:-30}
+    KEYCLOAK_ADMIN_REALM_URL: ${KEYCLOAK_ADMIN_REALM_URL:-}
+    KEYCLOAK_ADMIN_CLIENT_ID: ${KEYCLOAK_ADMIN_CLIENT_ID:-}
+    KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:-}
+    KEYCLOAK_ADMIN_TIMEOUT_SECONDS: ${KEYCLOAK_ADMIN_TIMEOUT_SECONDS:-10}
+    KEYCLOAK_PUBLIC_CLIENT_ID: ${KEYCLOAK_PUBLIC_CLIENT_ID:-}
+    KEYCLOAK_PUBLIC_REDIRECT_URI: ${KEYCLOAK_PUBLIC_REDIRECT_URI:-}
+    KEYCLOAK_PUBLIC_REGISTRATION_ENABLED: ${KEYCLOAK_PUBLIC_REGISTRATION_ENABLED:-false}
+    KEYCLOAK_SEND_VERIFICATION_EMAIL: ${KEYCLOAK_SEND_VERIFICATION_EMAIL:-false}
+    KEYCLOAK_DEFAULT_ROLE: ${KEYCLOAK_DEFAULT_ROLE:-fan}
+    KEYCLOAK_ASSIGNABLE_ROLES: ${KEYCLOAK_ASSIGNABLE_ROLES:-fan,editor,admin}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+    REGISTRATION_RATE_LIMIT: ${REGISTRATION_RATE_LIMIT:-5}
+    REGISTRATION_RATE_WINDOW_SECONDS: ${REGISTRATION_RATE_WINDOW_SECONDS:-3600}
+    EXPENSIVE_REQUEST_RATE_LIMIT: ${EXPENSIVE_REQUEST_RATE_LIMIT:-30}
+    EXPENSIVE_REQUEST_RATE_WINDOW_SECONDS: ${EXPENSIVE_REQUEST_RATE_WINDOW_SECONDS:-3600}
+    JOB_STREAM_KEY: ${JOB_STREAM_KEY:-racepulse:jobs:v1}
+    JOB_CONSUMER_GROUP: ${JOB_CONSUMER_GROUP:-racepulse-workers}
+    JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+    JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
+    JOB_RECOVERY_INTERVAL_SECONDS: ${JOB_RECOVERY_INTERVAL_SECONDS:-30}
+  volumes:
+    - fastf1-cache:/var/lib/racepulse/fastf1-cache
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-racepulse}
+      POSTGRES_USER: ${POSTGRES_USER:-racepulse}
+      # Required for a real database; intentionally no committed default.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, 'yes', --save, '60', '1']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  migrate:
+    <<: *racepulse-app
+    profiles: [migrate]
+    command: [alembic, upgrade, head]
+    restart: 'no'
+
+  api:
+    <<: *racepulse-app
+    restart: unless-stopped
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, '8000', --no-access-log]
+    ports:
+      - '127.0.0.1:${RACEPULSE_API_PORT:-8000}:8000'
+    healthcheck:
+      test: [CMD-SHELL, 'curl --fail --silent --show-error http://127.0.0.1:8000/api/v1/health']
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    <<: *racepulse-app
+    restart: unless-stopped
+    command: [python, -m, app.workers.job_worker]
+
+  # Keycloak is external by default. This profile is a local development
+  # convenience only; configure its realm and clients manually as documented.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: [keycloak]
+    command: [start-dev, --http-port=8080]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      # Required when this local-only profile is enabled.
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD:-}
+      KC_HEALTH_ENABLED: 'true'
+    ports:
+      - '127.0.0.1:${KEYCLOAK_PORT:-8080}:8080'
+
+volumes:
+  postgres-data:
+  redis-data:
+  fastf1-cache:

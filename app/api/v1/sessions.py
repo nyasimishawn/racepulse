@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.models.race_session import RaceSession
 from app.schemas.session import (
     SessionDetailResponse,
     SessionSummaryResponse,
@@ -12,6 +13,19 @@ from app.schemas.session import (
 from app.services.session_query_service import SessionQueryService
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
+
+
+@router.get(
+    "/{session_id}/source-metadata",
+    summary="Read downloaded circuit, session and track-status metadata",
+)
+def get_session_source_metadata(
+    session_id: UUID, db: Session = Depends(get_db),
+) -> dict:
+    session = db.get(RaceSession, session_id)
+    if session is None:
+        raise HTTPException(404, "Race session not found.")
+    return session.source_metadata
 
 
 @router.get(

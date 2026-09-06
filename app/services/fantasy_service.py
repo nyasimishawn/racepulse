@@ -10,8 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
 from app.models.fantasy import (
+    FantasyEntryStatus,
     FantasyGroup,
     FantasyGroupMember,
+    FantasyGroupWeekendEligibility,
     FantasyGroupWeekendResult,
     FantasyPickScoreStatus,
     FantasyPrediction,
@@ -19,6 +21,8 @@ from app.models.fantasy import (
     FantasyPredictionPickScore,
     FantasyQuestionResolution,
     FantasyQuestionResolutionStatus,
+    FantasyWeekendQuestion,
+    FantasyWeekendQuestionStatus,
 )
 from app.models.lap import Lap
 from app.models.meeting import Meeting
@@ -29,7 +33,9 @@ from app.models.user_profile import UserProfile
 from app.schemas.fantasy import (
     FantasyCommunityOptionResponse,
     FantasyCommunityResponse,
+    FantasyDashboardResponse,
     FantasyDriverOptionResponse,
+    FantasyEntryProgressResponse,
     FantasyFinalizeResponse,
     FantasyGroupCreateRequest,
     FantasyGroupDetailResponse,
@@ -48,6 +54,8 @@ from app.schemas.fantasy import (
     FantasyPredictionUpdateRequest,
     FantasyQuestionResolutionRequest,
     FantasyQuestionResolutionResponse,
+    FantasyQuestionSaveRequest,
+    FantasyQuestionSaveResponse,
     FantasyQuestionResponse,
     FantasyRaceSummaryResponse,
     FantasyScoreRunResponse,
@@ -121,6 +129,7 @@ class FantasyQuestionDefinition:
     selection_limit: int = 1
     qualifying_column: str | None = None
     race_position: int | None = None
+    snapshot_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,11 +201,82 @@ class FantasyService:
         race_session_id: UUID,
     ) -> FantasyPredictionResponse:
         context = self._load_race_context(race_session_id)
+        questions = self._questions_for_context(context)
         prediction = self._prediction_for(
             user_profile_id,
             race_session_id,
         )
+        if prediction is not None:
+            self._sync_entry_lifecycle(context, prediction, questions)
+
+        self.db.commit()
         return self._prediction_response(context, prediction)
+
+    def get_entry_progress(
+        self,
+        user_profile_id: UUID,
+        race_session_id: UUID,
+    ) -> FantasyEntryProgressResponse:
+        context = self._load_race_context(race_session_id)
+        prediction = self._prediction_for(
+            user_profile_id,
+            race_session_id,
+        )
+        response = self._entry_progress_response(
+            context,
+            prediction,
+            user_profile_id,
+        )
+        self.db.commit()
+        return response
+
+    def save_question(
+        self,
+        *,
+        user_profile_id: UUID,
+        race_session_id: UUID,
+        question_key: str,
+        payload: FantasyQuestionSaveRequest,
+    ) -> FantasyQuestionSaveResponse:
+        normalized_key = question_key.strip().upper()
+        update = FantasyPredictionUpdateRequest(
+            answers=(
+                []
+                if payload.clear
+                else [
+                    FantasyPredictionAnswerInput(
+                        question_key=normalized_key,
+                        driver_id=payload.driver_id,
+                        team_id=payload.team_id,
+                        driver_ids=payload.driver_ids,
+                    )
+                ]
+            ),
+            clear_question_keys=[normalized_key] if payload.clear else [],
+        )
+        self.save_prediction(
+            user_profile_id,
+            race_session_id,
+            update,
+        )
+        entry = self.get_entry_progress(
+            user_profile_id,
+            race_session_id,
+        )
+        question = next(
+            item for item in entry.questions if item.key == normalized_key
+        )
+        return FantasyQuestionSaveResponse(entry=entry, question=question)
+
+    def get_dashboard(
+        self,
+        *,
+        user_profile_id: UUID,
+        year: int | None,
+    ) -> FantasyDashboardResponse:
+        response = self._dashboard_response(user_profile_id, year)
+        self.db.commit()
+        return response
 
     def save_prediction(
         self,
@@ -205,9 +285,10 @@ class FantasyService:
         payload: FantasyPredictionUpdateRequest,
     ) -> FantasyPredictionResponse:
         context = self._load_race_context(race_session_id)
+        questions = self._questions_for_context(context)
         definitions = {
             question.key: question
-            for question in self._questions_for_context(context)
+            for question in questions
         }
 
         if not payload.answers and not payload.clear_question_keys:
@@ -299,6 +380,11 @@ class FantasyService:
             ]
 
         self._validate_podium_choices(picks_by_key)
+        self._sync_entry_lifecycle(
+            context,
+            prediction,
+            list(definitions.values()),
+        )
         self.db.commit()
 
         return self.get_prediction(
@@ -312,12 +398,13 @@ class FantasyService:
     ) -> FantasyScoreRunResponse:
         context = self._load_race_context(race_session_id)
         resolutions = self._resolutions_for_race(race_session_id)
+        questions = self._questions_for_context(context)
 
         resolved_keys: list[str] = []
         pending_keys: list[str] = []
         updated_pick_count = 0
 
-        for question in self._questions_for_context(context):
+        for question in questions:
             if not self._question_is_locked(question):
                 pending_keys.append(question.key)
                 continue
@@ -362,6 +449,7 @@ class FantasyService:
                 resolution,
             )
 
+        self._sync_entries_for_race(context, questions)
         self.db.commit()
 
         return FantasyScoreRunResponse(
@@ -380,9 +468,10 @@ class FantasyService:
         resolved_by_profile_id: UUID,
     ) -> FantasyQuestionResolutionResponse:
         context = self._load_race_context(race_session_id)
+        questions = self._questions_for_context(context)
         definitions = {
             question.key: question
-            for question in self._questions_for_context(context)
+            for question in questions
         }
         question = definitions.get(question_key.strip().upper())
 
@@ -446,6 +535,10 @@ class FantasyService:
         )
 
         self._score_question(context, question, resolution)
+        if self._has_finalized_results(race_session_id):
+            self._finalize_groups(context, questions)
+
+        self._sync_entries_for_race(context, questions)
         self.db.commit()
 
         return self._resolution_response(resolution)
@@ -469,78 +562,11 @@ class FantasyService:
                 score_run.pending_question_keys
             )
 
-        groups = self.db.scalars(select(FantasyGroup)).all()
-        result_count = 0
-
-        for group in groups:
-            members = self.db.scalars(
-                select(FantasyGroupMember).where(
-                    FantasyGroupMember.group_id == group.id
-                )
-            ).all()
-
-            eligible_members = [
-                member
-                for member in members
-                if self._joined_before_race(
-                    member.created_at,
-                    context.race.started_at,
-                )
-            ]
-
-            ranked_members = self._rank_group_members(
-                race_session_id,
-                eligible_members,
-            )
-
-            for (
-                rank,
-                profile_id,
-                points,
-                podium_hits,
-                qualifying_hits,
-                scored_count,
-            ) in ranked_members:
-                result = self.db.scalar(
-                    select(FantasyGroupWeekendResult).where(
-                        FantasyGroupWeekendResult.group_id == group.id,
-                        FantasyGroupWeekendResult.race_session_id
-                        == race_session_id,
-                        FantasyGroupWeekendResult.user_profile_id
-                        == profile_id,
-                    )
-                )
-
-                if result is None:
-                    result = FantasyGroupWeekendResult(
-                        group_id=group.id,
-                        race_session_id=race_session_id,
-                        user_profile_id=profile_id,
-                        rank=rank,
-                        points=points,
-                        exact_podium_hits=podium_hits,
-                        exact_qualifying_hits=qualifying_hits,
-                        scored_question_count=scored_count,
-                        finalized_at=self._now(),
-                    )
-                    self.db.add(result)
-                else:
-                    result.rank = rank
-                    result.points = points
-                    result.exact_podium_hits = podium_hits
-                    result.exact_qualifying_hits = qualifying_hits
-                    result.scored_question_count = scored_count
-                    result.finalized_at = self._now()
-
-                result_count += 1
-
+        questions = self._questions_for_context(context)
+        response = self._finalize_groups(context, questions)
+        self._sync_entries_for_race(context, questions)
         self.db.commit()
-
-        return FantasyFinalizeResponse(
-            race_session_id=race_session_id,
-            finalized_group_count=len(groups),
-            created_or_updated_result_count=result_count,
-        )
+        return response
 
     def get_global_leaderboard(
         self,
@@ -652,6 +678,7 @@ class FantasyService:
             FantasyGroupMember(
                 group_id=group.id,
                 user_profile_id=owner_profile_id,
+                created_at=self._now(),
             )
         )
         self.db.commit()
@@ -683,9 +710,9 @@ class FantasyService:
         payload: FantasyGroupJoinRequest,
     ) -> FantasyGroupDetailResponse:
         group = self.db.scalar(
-            select(FantasyGroup).where(
-                FantasyGroup.invite_code == payload.invite_code
-            )
+            select(FantasyGroup)
+            .where(FantasyGroup.invite_code == payload.invite_code)
+            .with_for_update()
         )
 
         if group is None:
@@ -702,6 +729,8 @@ class FantasyService:
 
         if existing_member is not None:
             return self._group_detail(group, profile_id)
+
+        self._materialize_locked_group_eligibilities(group)
 
         member_count = int(
             self.db.scalar(
@@ -721,6 +750,7 @@ class FantasyService:
             FantasyGroupMember(
                 group_id=group.id,
                 user_profile_id=profile_id,
+                created_at=self._now(),
             )
         )
         self.db.commit()
@@ -779,6 +809,7 @@ class FantasyService:
                 "That user is not a member of this group."
             )
 
+        self._materialize_locked_group_eligibilities(group)
         self.db.delete(member)
         self.db.commit()
 
@@ -1067,6 +1098,130 @@ class FantasyService:
         self,
         context: FantasyRaceContext,
     ) -> list[FantasyQuestionDefinition]:
+        derived_questions = self._derived_questions_for_context(context)
+        snapshots = self.db.scalars(
+            select(FantasyWeekendQuestion)
+            .where(
+                FantasyWeekendQuestion.race_session_id == context.race.id
+            )
+            .order_by(
+                FantasyWeekendQuestion.sort_order,
+                FantasyWeekendQuestion.question_key,
+            )
+        ).all()
+        snapshots_by_key = {
+            snapshot.question_key: snapshot for snapshot in snapshots
+        }
+        derived_by_key = {
+            question.key: question for question in derived_questions
+        }
+
+        for sort_order, question in enumerate(derived_questions, start=1):
+            snapshot = snapshots_by_key.get(question.key)
+
+            if snapshot is None:
+                snapshot = FantasyWeekendQuestion(
+                    race_session_id=context.race.id,
+                    question_key=question.key,
+                    label=question.label,
+                    category=question.category,
+                    answer_kind=question.answer_kind,
+                    target_session_id=question.target_session_id,
+                    target_session_name=question.target_session_name,
+                    locks_at=question.locks_at,
+                    max_points=question.max_points,
+                    selection_limit=question.selection_limit,
+                    sort_order=sort_order,
+                    status=self._snapshot_status_for_lock(question.locks_at),
+                )
+                self.db.add(snapshot)
+                snapshots.append(snapshot)
+                snapshots_by_key[question.key] = snapshot
+                continue
+
+            if snapshot.status not in {
+                FantasyWeekendQuestionStatus.RESOLVED,
+                FantasyWeekendQuestionStatus.NOT_SCORED,
+            }:
+                snapshot.status = self._snapshot_status_for_lock(
+                    snapshot.locks_at
+                )
+
+        self.db.flush()
+        snapshots.sort(
+            key=lambda snapshot: (
+                snapshot.sort_order,
+                snapshot.question_key,
+            )
+        )
+
+        return [
+            self._definition_from_snapshot(
+                snapshot,
+                derived_by_key.get(snapshot.question_key),
+            )
+            for snapshot in snapshots
+        ]
+
+    def _definition_from_snapshot(
+        self,
+        snapshot: FantasyWeekendQuestion,
+        derived: FantasyQuestionDefinition | None,
+    ) -> FantasyQuestionDefinition:
+        qualifying_column = (
+            derived.qualifying_column if derived is not None else None
+        )
+        race_position = (
+            derived.race_position if derived is not None else None
+        )
+
+        if qualifying_column is None and snapshot.question_key in {
+            "Q1_FASTEST",
+            "Q2_FASTEST",
+            "Q3_FASTEST",
+        }:
+            qualifying_column = (
+                f"{snapshot.question_key[:2].casefold()}_time_ms"
+            )
+
+        if race_position is None:
+            race_position = {
+                "RACE_P1": 1,
+                "RACE_P2": 2,
+                "RACE_P3": 3,
+            }.get(snapshot.question_key)
+
+        return FantasyQuestionDefinition(
+            key=snapshot.question_key,
+            label=snapshot.label,
+            category=snapshot.category,
+            answer_kind=snapshot.answer_kind,
+            target_session_id=snapshot.target_session_id,
+            target_session_name=snapshot.target_session_name,
+            locks_at=snapshot.locks_at,
+            max_points=snapshot.max_points,
+            selection_limit=snapshot.selection_limit,
+            qualifying_column=qualifying_column,
+            race_position=race_position,
+            snapshot_id=snapshot.id,
+        )
+
+    def _snapshot_status_for_lock(
+        self,
+        locks_at: datetime | None,
+    ) -> FantasyWeekendQuestionStatus:
+        if locks_at is None:
+            return FantasyWeekendQuestionStatus.UNAVAILABLE
+
+        if self._now() >= self._as_utc(locks_at):
+            return FantasyWeekendQuestionStatus.LOCKED
+
+        return FantasyWeekendQuestionStatus.OPEN
+
+    def _derived_questions_for_context(
+        self,
+        context: FantasyRaceContext,
+    ) -> list[FantasyQuestionDefinition]:
         questions: list[FantasyQuestionDefinition] = []
         practice_by_identifier = {
             session.session_identifier.strip().upper(): session
@@ -1221,24 +1376,11 @@ class FantasyService:
         )
 
         questions = [
-            FantasyQuestionResponse(
-                key=question.key,
-                label=question.label,
-                category=question.category,
-                answer_kind=question.answer_kind,
-                target_session_id=question.target_session_id,
-                target_session_name=question.target_session_name,
-                locks_at=question.locks_at,
-                state=self._question_state(question),
-                max_points=question.max_points,
-                selection_limit=question.selection_limit,
-                answer=self._answer_response(
-                    picks_by_key.get(question.key),
-                    scores_by_pick,
-                ),
-                resolution=self._resolution_response(
-                    resolutions.get(question.key)
-                ),
+            self._question_response(
+                question,
+                picks_by_key.get(question.key),
+                scores_by_pick,
+                resolutions.get(question.key),
             )
             for question in self._questions_for_context(context)
         ]
@@ -1251,6 +1393,253 @@ class FantasyService:
             drivers=drivers,
             teams=teams,
         )
+
+    def _entry_progress_response(
+        self,
+        context: FantasyRaceContext,
+        prediction: FantasyPrediction | None,
+        user_profile_id: UUID,
+    ) -> FantasyEntryProgressResponse:
+        definitions = self._questions_for_context(context)
+
+        if prediction is not None:
+            self._sync_entry_lifecycle(context, prediction, definitions)
+
+        prediction_response = self._prediction_response(context, prediction)
+        questions = prediction_response.questions
+        total_question_count = len(questions)
+        answered_question_count = sum(
+            question.is_answered for question in questions
+        )
+        locked_question_count = sum(
+            question.state == "LOCKED" for question in questions
+        )
+        resolved_question_count = sum(
+            question.status in {"RESOLVED", "NOT_SCORED"}
+            for question in questions
+        )
+        scored_question_count = sum(
+            question.answer is not None
+            and question.answer.score is not None
+            and question.answer.score.status in {"SCORED", "NOT_SCORED"}
+            for question in questions
+        )
+
+        return FantasyEntryProgressResponse(
+            prediction_id=prediction.id if prediction is not None else None,
+            race=prediction_response.race,
+            status=(
+                prediction.status.value
+                if prediction is not None
+                else FantasyEntryStatus.DRAFT.value
+            ),
+            total_points=prediction_response.total_points,
+            total_question_count=total_question_count,
+            answered_question_count=answered_question_count,
+            locked_question_count=locked_question_count,
+            resolved_question_count=resolved_question_count,
+            scored_question_count=scored_question_count,
+            completion_percentage=(
+                round(
+                    (answered_question_count / total_question_count) * 100,
+                    1,
+                )
+                if total_question_count
+                else 0.0
+            ),
+            next_deadline=self._next_deadline(definitions),
+            personal_race_rank=(
+                self._personal_global_rank(
+                    user_profile_id,
+                    year=None,
+                    race_session_id=context.race.id,
+                )
+                if prediction is not None
+                else None
+            ),
+            personal_season_rank=(
+                self._personal_global_rank(
+                    user_profile_id,
+                    year=context.meeting.year,
+                    race_session_id=None,
+                )
+                if prediction is not None
+                else None
+            ),
+            questions=questions,
+        )
+
+    def _dashboard_response(
+        self,
+        user_profile_id: UUID,
+        year: int | None,
+    ) -> FantasyDashboardResponse:
+        selected_year = year or self._now().year
+        rows = self.db.execute(
+            select(RaceSession, Meeting)
+            .join(Meeting, Meeting.id == RaceSession.meeting_id)
+            .where(Meeting.year == selected_year)
+            .order_by(RaceSession.started_at, RaceSession.name)
+        ).all()
+        entries: list[FantasyEntryProgressResponse] = []
+
+        for race, _ in rows:
+            if not self._is_race_session(race):
+                continue
+
+            context = self._load_race_context(race.id)
+            prediction = self._prediction_for(user_profile_id, race.id)
+
+            if (
+                prediction is None
+                and race.started_at is not None
+                and self._as_utc(race.started_at) < self._now()
+            ):
+                continue
+
+            entries.append(
+                self._entry_progress_response(
+                    context,
+                    prediction,
+                    user_profile_id,
+                )
+            )
+
+        entries.sort(
+            key=lambda entry: (
+                entry.next_deadline is None,
+                entry.next_deadline or datetime.max.replace(tzinfo=UTC),
+                entry.race.started_at or datetime.max.replace(tzinfo=UTC),
+            )
+        )
+        season_stats = self._global_score_stats(
+            year=selected_year,
+            race_session_id=None,
+        )
+        season_points = int(
+            season_stats.get(user_profile_id, ["", 0, 0, 0])[1]
+        )
+
+        return FantasyDashboardResponse(
+            season_year=selected_year,
+            season_points=season_points,
+            season_rank=self._personal_global_rank(
+                user_profile_id,
+                year=selected_year,
+                race_session_id=None,
+            ),
+            next_deadline=next(
+                (
+                    entry.next_deadline
+                    for entry in entries
+                    if entry.next_deadline is not None
+                ),
+                None,
+            ),
+            entries=entries,
+            groups=self.list_groups(user_profile_id),
+        )
+
+    def _sync_entry_lifecycle(
+        self,
+        context: FantasyRaceContext,
+        prediction: FantasyPrediction,
+        questions: list[FantasyQuestionDefinition],
+    ) -> None:
+        picks = self.db.scalars(
+            select(FantasyPredictionPick).where(
+                FantasyPredictionPick.prediction_id == prediction.id
+            )
+        ).all()
+        question_keys = {question.key for question in questions}
+        answered_question_count = sum(
+            pick.question_key in question_keys for pick in picks
+        )
+        resolutions = self._resolutions_for_race(context.race.id)
+        lock_times = [
+            self._as_utc(question.locks_at)
+            for question in questions
+            if question.locks_at is not None
+        ]
+        all_locked = bool(questions) and all(
+            self._question_is_locked(question) for question in questions
+        )
+        all_resolved = bool(questions) and all(
+            (resolution := resolutions.get(question.key)) is not None
+            and resolution.status
+            != FantasyQuestionResolutionStatus.PENDING
+            for question in questions
+        )
+        has_any_resolution = any(
+            resolution.status != FantasyQuestionResolutionStatus.PENDING
+            for resolution in resolutions.values()
+        )
+
+        prediction.first_lock_at = min(lock_times) if lock_times else None
+        prediction.last_lock_at = max(lock_times) if lock_times else None
+
+        if self._has_finalized_result_for_profile(
+            context.race.id,
+            prediction.user_profile_id,
+        ):
+            status = FantasyEntryStatus.FINALIZED
+        elif all_locked and all_resolved:
+            status = FantasyEntryStatus.SCORED
+        elif all_locked and has_any_resolution:
+            status = FantasyEntryStatus.SCORING
+        elif all_locked:
+            status = FantasyEntryStatus.LOCKED
+        elif answered_question_count == 0:
+            status = FantasyEntryStatus.DRAFT
+        elif answered_question_count == len(questions):
+            status = FantasyEntryStatus.COMPLETE
+        else:
+            status = FantasyEntryStatus.IN_PROGRESS
+
+        prediction.status = status
+        now = self._now()
+
+        if (
+            answered_question_count == len(questions)
+            and questions
+            and prediction.completed_at is None
+        ):
+            prediction.completed_at = now
+
+        if status in {
+            FantasyEntryStatus.SCORED,
+            FantasyEntryStatus.FINALIZED,
+        }:
+            prediction.scored_at = now
+
+        if status == FantasyEntryStatus.FINALIZED:
+            prediction.finalized_at = now
+
+    def _sync_entries_for_race(
+        self,
+        context: FantasyRaceContext,
+        questions: list[FantasyQuestionDefinition],
+    ) -> None:
+        predictions = self.db.scalars(
+            select(FantasyPrediction).where(
+                FantasyPrediction.race_session_id == context.race.id
+            )
+        ).all()
+
+        for prediction in predictions:
+            self._sync_entry_lifecycle(context, prediction, questions)
+
+    def _next_deadline(
+        self,
+        questions: list[FantasyQuestionDefinition],
+    ) -> datetime | None:
+        deadlines = sorted(
+            self._as_utc(question.locks_at)
+            for question in questions
+            if question.locks_at is not None
+            and self._now() < self._as_utc(question.locks_at)
+        )
+        return deadlines[0] if deadlines else None
 
     def _race_summary(
         self,
@@ -1638,6 +2027,24 @@ class FantasyService:
         resolution.resolved_by_profile_id = resolved_by_profile_id
         resolution.resolved_at = self._now()
 
+        if question.snapshot_id is not None:
+            snapshot = self.db.get(
+                FantasyWeekendQuestion,
+                question.snapshot_id,
+            )
+            if snapshot is not None:
+                snapshot.status = {
+                    FantasyQuestionResolutionStatus.RESOLVED: (
+                        FantasyWeekendQuestionStatus.RESOLVED
+                    ),
+                    FantasyQuestionResolutionStatus.NOT_SCORED: (
+                        FantasyWeekendQuestionStatus.NOT_SCORED
+                    ),
+                }.get(
+                    status,
+                    self._snapshot_status_for_lock(question.locks_at),
+                )
+
         return resolution
 
     def _validate_manual_resolution(
@@ -1981,6 +2388,46 @@ class FantasyService:
             ),
         )
 
+    def _question_response(
+        self,
+        question: FantasyQuestionDefinition,
+        pick: FantasyPredictionPick | None,
+        scores_by_pick: dict[UUID, FantasyPredictionPickScore],
+        resolution: FantasyQuestionResolution | None,
+    ) -> FantasyQuestionResponse:
+        status = self._question_status(question, resolution)
+
+        return FantasyQuestionResponse(
+            key=question.key,
+            label=question.label,
+            category=question.category,
+            answer_kind=question.answer_kind,
+            target_session_id=question.target_session_id,
+            target_session_name=question.target_session_name,
+            locks_at=question.locks_at,
+            state=self._question_state(question),
+            max_points=question.max_points,
+            selection_limit=question.selection_limit,
+            answer=self._answer_response(pick, scores_by_pick),
+            resolution=self._resolution_response(resolution),
+            status=status.value,
+            is_answered=pick is not None,
+        )
+
+    def _question_status(
+        self,
+        question: FantasyQuestionDefinition,
+        resolution: FantasyQuestionResolution | None,
+    ) -> FantasyWeekendQuestionStatus:
+        if resolution is not None:
+            if resolution.status == FantasyQuestionResolutionStatus.RESOLVED:
+                return FantasyWeekendQuestionStatus.RESOLVED
+
+            if resolution.status == FantasyQuestionResolutionStatus.NOT_SCORED:
+                return FantasyWeekendQuestionStatus.NOT_SCORED
+
+        return self._snapshot_status_for_lock(question.locks_at)
+
     def _resolution_response(
         self,
         resolution: FantasyQuestionResolution | None,
@@ -2000,10 +2447,194 @@ class FantasyService:
             resolved_at=resolution.resolved_at,
         )
 
+    def _finalize_groups(
+        self,
+        context: FantasyRaceContext,
+        questions: list[FantasyQuestionDefinition],
+    ) -> FantasyFinalizeResponse:
+        first_lock_at = self._first_question_lock(questions)
+
+        if first_lock_at is None:
+            raise FantasyInvalidRequestError(
+                "Fantasy questions need a scheduled lock time before "
+                "group results can be finalized."
+            )
+
+        groups = self.db.scalars(select(FantasyGroup)).all()
+        result_count = 0
+
+        for group in groups:
+            eligible_members = self._eligible_group_members(
+                group,
+                context,
+                first_lock_at,
+            )
+            ranked_members = self._rank_group_members(
+                context.race.id,
+                eligible_members,
+            )
+            existing_results = self.db.scalars(
+                select(FantasyGroupWeekendResult).where(
+                    FantasyGroupWeekendResult.group_id == group.id,
+                    FantasyGroupWeekendResult.race_session_id
+                    == context.race.id,
+                )
+            ).all()
+            results_by_profile_id = {
+                result.user_profile_id: result
+                for result in existing_results
+            }
+            eligible_profile_ids = {
+                member.user_profile_id for member in eligible_members
+            }
+
+            for result in existing_results:
+                if result.user_profile_id not in eligible_profile_ids:
+                    self.db.delete(result)
+
+            for (
+                rank,
+                profile_id,
+                points,
+                podium_hits,
+                qualifying_hits,
+                scored_count,
+            ) in ranked_members:
+                result = results_by_profile_id.get(profile_id)
+
+                if result is None:
+                    result = FantasyGroupWeekendResult(
+                        group_id=group.id,
+                        race_session_id=context.race.id,
+                        user_profile_id=profile_id,
+                        rank=rank,
+                        points=points,
+                        exact_podium_hits=podium_hits,
+                        exact_qualifying_hits=qualifying_hits,
+                        scored_question_count=scored_count,
+                        finalized_at=self._now(),
+                    )
+                    self.db.add(result)
+                else:
+                    result.rank = rank
+                    result.points = points
+                    result.exact_podium_hits = podium_hits
+                    result.exact_qualifying_hits = qualifying_hits
+                    result.scored_question_count = scored_count
+                    result.finalized_at = self._now()
+
+                result_count += 1
+
+        self.db.flush()
+        return FantasyFinalizeResponse(
+            race_session_id=context.race.id,
+            finalized_group_count=len(groups),
+            created_or_updated_result_count=result_count,
+        )
+
+    def _eligible_group_members(
+        self,
+        group: FantasyGroup,
+        context: FantasyRaceContext,
+        first_lock_at: datetime,
+    ) -> list[FantasyGroupWeekendEligibility]:
+        existing = self.db.scalars(
+            select(FantasyGroupWeekendEligibility).where(
+                FantasyGroupWeekendEligibility.group_id == group.id,
+                FantasyGroupWeekendEligibility.race_session_id
+                == context.race.id,
+            )
+        ).all()
+        existing_profile_ids = {
+            eligibility.user_profile_id for eligibility in existing
+        }
+        members = self.db.scalars(
+            select(FantasyGroupMember).where(
+                FantasyGroupMember.group_id == group.id
+            )
+        ).all()
+
+        for member in members:
+            if (
+                member.user_profile_id not in existing_profile_ids
+                and self._joined_by_first_question_lock(
+                    member.created_at,
+                    first_lock_at,
+                )
+            ):
+                self.db.add(
+                    FantasyGroupWeekendEligibility(
+                        group_id=group.id,
+                        race_session_id=context.race.id,
+                        user_profile_id=member.user_profile_id,
+                        membership_joined_at=member.created_at,
+                        first_question_locks_at=first_lock_at,
+                        locked_at=self._now(),
+                    )
+                )
+
+        self.db.flush()
+        return self.db.scalars(
+            select(FantasyGroupWeekendEligibility)
+            .where(
+                FantasyGroupWeekendEligibility.group_id == group.id,
+                FantasyGroupWeekendEligibility.race_session_id
+                == context.race.id,
+            )
+            .order_by(FantasyGroupWeekendEligibility.created_at)
+        ).all()
+
+    def _materialize_locked_group_eligibilities(
+        self,
+        group: FantasyGroup,
+    ) -> None:
+        race_sessions = self.db.scalars(select(RaceSession)).all()
+
+        for race_session in race_sessions:
+            if not self._is_race_session(race_session):
+                continue
+
+            context = self._load_race_context(race_session.id)
+            first_lock_at = self._first_question_lock(
+                self._questions_for_context(context)
+            )
+
+            if (
+                first_lock_at is not None
+                and self._now() >= self._as_utc(first_lock_at)
+            ):
+                self._eligible_group_members(
+                    group,
+                    context,
+                    first_lock_at,
+                )
+
+    @staticmethod
+    def _first_question_lock(
+        questions: list[FantasyQuestionDefinition],
+    ) -> datetime | None:
+        lock_times = [
+            question.locks_at
+            for question in questions
+            if question.locks_at is not None
+        ]
+        return min(lock_times) if lock_times else None
+
+    def _joined_by_first_question_lock(
+        self,
+        joined_at: datetime,
+        first_question_locks_at: datetime,
+    ) -> bool:
+        return self._as_utc(joined_at) <= self._as_utc(
+            first_question_locks_at
+        )
+
     def _rank_group_members(
         self,
         race_session_id: UUID,
-        members: list[FantasyGroupMember],
+        members: list[
+            FantasyGroupMember | FantasyGroupWeekendEligibility
+        ],
     ) -> list[tuple[int, UUID, int, int, int, int]]:
         values: list[tuple[UUID, int, int, int, int]] = []
 
@@ -2104,6 +2735,165 @@ class FantasyService:
         )
 
         return points, podium_hits, qualifying_hits, len(rows)
+
+    def _global_score_stats(
+        self,
+        *,
+        year: int | None,
+        race_session_id: UUID | None,
+    ) -> dict[UUID, list[object]]:
+        statement = (
+            select(
+                UserProfile.id,
+                UserProfile.display_name,
+                FantasyPredictionPick.question_key,
+                FantasyPredictionPickScore.points_awarded,
+                FantasyPredictionPickScore.is_exact,
+            )
+            .select_from(FantasyPredictionPickScore)
+            .join(
+                FantasyPredictionPick,
+                FantasyPredictionPick.id
+                == FantasyPredictionPickScore.pick_id,
+            )
+            .join(
+                FantasyPrediction,
+                FantasyPrediction.id
+                == FantasyPredictionPick.prediction_id,
+            )
+            .join(
+                UserProfile,
+                UserProfile.id == FantasyPrediction.user_profile_id,
+            )
+            .join(
+                RaceSession,
+                RaceSession.id == FantasyPrediction.race_session_id,
+            )
+            .join(Meeting, Meeting.id == RaceSession.meeting_id)
+            .where(
+                FantasyPredictionPickScore.status
+                == FantasyPickScoreStatus.SCORED
+            )
+        )
+
+        if year is not None:
+            statement = statement.where(Meeting.year == year)
+
+        if race_session_id is not None:
+            statement = statement.where(
+                FantasyPrediction.race_session_id == race_session_id
+            )
+
+        stats: dict[UUID, list[object]] = {}
+
+        for (
+            profile_id,
+            display_name,
+            question_key,
+            points_awarded,
+            is_exact,
+        ) in self.db.execute(statement).all():
+            row = stats.setdefault(
+                profile_id,
+                [display_name or "RacePulse fan", 0, 0, 0],
+            )
+            row[1] = int(row[1]) + int(points_awarded)
+
+            if is_exact and question_key in self._PODIUM_KEYS:
+                row[2] = int(row[2]) + 1
+
+            if is_exact and question_key in self._QUALIFYING_KEYS:
+                row[3] = int(row[3]) + 1
+
+        return stats
+
+    def _personal_global_rank(
+        self,
+        user_profile_id: UUID,
+        *,
+        year: int | None,
+        race_session_id: UUID | None,
+    ) -> int | None:
+        stats = self._global_score_stats(
+            year=year,
+            race_session_id=race_session_id,
+        )
+
+        if user_profile_id not in stats:
+            if not self._profile_has_prediction_in_scope(
+                user_profile_id,
+                year=year,
+                race_session_id=race_session_id,
+            ):
+                return None
+
+            profile = self.db.get(UserProfile, user_profile_id)
+            stats[user_profile_id] = [
+                self._profile_display_name(profile),
+                0,
+                0,
+                0,
+            ]
+
+        return next(
+            (
+                row.rank
+                for row in self._leaderboard_rows(stats, user_profile_id)
+                if row.is_current_user
+            ),
+            None,
+        )
+
+    def _profile_has_prediction_in_scope(
+        self,
+        user_profile_id: UUID,
+        *,
+        year: int | None,
+        race_session_id: UUID | None,
+    ) -> bool:
+        statement = (
+            select(FantasyPrediction.id)
+            .join(
+                RaceSession,
+                RaceSession.id == FantasyPrediction.race_session_id,
+            )
+            .join(Meeting, Meeting.id == RaceSession.meeting_id)
+            .where(FantasyPrediction.user_profile_id == user_profile_id)
+            .limit(1)
+        )
+
+        if year is not None:
+            statement = statement.where(Meeting.year == year)
+
+        if race_session_id is not None:
+            statement = statement.where(
+                FantasyPrediction.race_session_id == race_session_id
+            )
+
+        return self.db.scalar(statement) is not None
+
+    def _has_finalized_results(self, race_session_id: UUID) -> bool:
+        return self.db.scalar(
+            select(FantasyGroupWeekendResult.id)
+            .where(
+                FantasyGroupWeekendResult.race_session_id == race_session_id
+            )
+            .limit(1)
+        ) is not None
+
+    def _has_finalized_result_for_profile(
+        self,
+        race_session_id: UUID,
+        user_profile_id: UUID,
+    ) -> bool:
+        return self.db.scalar(
+            select(FantasyGroupWeekendResult.id)
+            .where(
+                FantasyGroupWeekendResult.race_session_id == race_session_id,
+                FantasyGroupWeekendResult.user_profile_id == user_profile_id,
+            )
+            .limit(1)
+        ) is not None
 
     def _leaderboard_rows(
         self,

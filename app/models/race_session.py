@@ -1,7 +1,9 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, Uuid, func
+from sqlalchemy import (
+    DateTime, ForeignKey, JSON, String, UniqueConstraint, Uuid, func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -29,6 +31,9 @@ class RaceSession(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     session_identifier: Mapped[str] = mapped_column(String(20), nullable=False)
     session_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_metadata: Mapped[dict] = mapped_column(
+        JSON, default=dict, nullable=False,
+    )
 
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

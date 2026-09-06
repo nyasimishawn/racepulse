@@ -1,4 +1,5 @@
 from fastapi import HTTPException, Request, status
+from redis import Redis as SyncRedis
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -11,6 +12,16 @@ class RedisUnavailableError(RuntimeError):
 
 def create_redis_client() -> Redis:
     return Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1,
+        socket_timeout=1,
+    )
+
+
+def create_sync_redis_client() -> SyncRedis:
+    """Return the synchronous client used by durable job code."""
+    return SyncRedis.from_url(
         settings.redis_url,
         decode_responses=True,
         socket_connect_timeout=1,

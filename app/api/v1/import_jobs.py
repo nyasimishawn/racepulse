@@ -1,16 +1,20 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.db.database import get_db
+from app.models.durable_job import DurableJobType
+from app.models.import_job import ImportJob
 from app.schemas.import_job import ImportJobCreate, ImportJobResponse
 from app.services.import_job_service import ImportJobService
+from app.services.job_dispatch_service import enqueue_job
 from app.services.session_import_service import (
     ImportJobNotFoundError,
     ImportJobStateError,
     SessionImportError,
-    SessionImportService,
 )
 
 router = APIRouter(prefix="/import-jobs", tags=["Import Jobs"])
@@ -24,9 +28,22 @@ router = APIRouter(prefix="/import-jobs", tags=["Import Jobs"])
 )
 def create_import_job(
     payload: ImportJobCreate,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> ImportJobResponse:
-    return ImportJobService.create(db, payload)
+    del current_user
+    job = ImportJobService.create(
+        db,
+        payload,
+        idempotency_key=idempotency_key,
+    )
+    return _queue_import(db, job, idempotency_key)
 
 
 @router.get(
@@ -36,8 +53,10 @@ def create_import_job(
 )
 def get_import_job(
     job_id: UUID,
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> ImportJobResponse:
+    del current_user
     job = ImportJobService.get_by_id(db, job_id)
 
     if job is None:
@@ -56,10 +75,16 @@ def get_import_job(
 )
 def run_import_job(
     job_id: UUID,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> ImportJobResponse:
+    del current_user
     try:
-        return SessionImportService(db).run(job_id)
+        job = ImportJobService.get_by_id(db, job_id)
+        if job is None:
+            raise ImportJobNotFoundError("Import job not found.")
+        return _queue_import(db, job, job.idempotency_key)
 
     except ImportJobNotFoundError as error:
         raise HTTPException(
@@ -78,3 +103,26 @@ def run_import_job(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(error),
         ) from error
+
+
+def _queue_import(
+    db: Session,
+    job: ImportJob,
+    idempotency_key: str | None,
+) -> ImportJob:
+    durable_job = enqueue_job(
+        db,
+        job_type=DurableJobType.SESSION_IMPORT,
+        target_id=job.id,
+        idempotency_key=(
+            f"session-import:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"import_job_id": str(job.id)},
+    )
+    if job.durable_job_id != durable_job.id:
+        job.durable_job_id = durable_job.id
+        db.commit()
+        db.refresh(job)
+    return job

@@ -1,10 +1,22 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    status,
+)
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import expensive_request_rate_limit
+from app.core.security import AuthenticatedUser, require_roles
 from app.db.database import get_db
+from app.models.durable_job import DurableJobType
+from app.schemas.durable_job import DurableJobResponse
 from app.schemas.lap import LapImportResponse, LapResponse
+from app.services.job_dispatch_service import enqueue_job
 from app.services.lap_service import (
     LapImportError,
     LapImportService,
@@ -21,12 +33,16 @@ router = APIRouter(
 @router.post(
     "/import",
     response_model=LapImportResponse,
-    summary="Import lap data for an existing race session",
+    summary="Legacy synchronous bulk lap import",
+    deprecated=True,
 )
 def import_laps(
     race_session_id: UUID,
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> LapImportResponse:
+    del current_user
     try:
         laps_upserted, laps_skipped = LapImportService(db).import_laps(
             race_session_id
@@ -44,12 +60,47 @@ def import_laps(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(error),
         ) from error
-
     except LapImportError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(error),
         ) from error
+
+
+@router.post(
+    "/import-jobs",
+    response_model=DurableJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue bulk lap import work",
+)
+def queue_lap_import(
+    race_session_id: UUID,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+    _: None = Depends(expensive_request_rate_limit),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
+    db: Session = Depends(get_db),
+) -> DurableJobResponse:
+    del current_user
+    if not LapQueryService(db).session_exists(race_session_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Race session not found.",
+        )
+    return enqueue_job(
+        db,
+        job_type=DurableJobType.SESSION_LAPS_IMPORT,
+        target_id=race_session_id,
+        idempotency_key=(
+            f"session-laps-import:{idempotency_key}"
+            if idempotency_key
+            else None
+        ),
+        payload={"race_session_id": str(race_session_id)},
+    )
 
 
 @router.get(
