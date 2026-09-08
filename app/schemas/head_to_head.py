@@ -1,9 +1,11 @@
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+from app.schemas.race_context import PitEventResponse, RaceControlEventResponse
 
 
 class HeadToHeadRaceResultResponse(BaseModel):
+    positions_gained: int | None = None
     finishing_position: int | None
     classified_position: str | None
     grid_position: int | None
@@ -67,6 +69,7 @@ class HeadToHeadPitStopProxyResponse(BaseModel):
 
 
 class HeadToHeadDriverResponse(BaseModel):
+    pit_events: list[PitEventResponse] = Field(default_factory=list)
     driver_number: str
     abbreviation: str | None
     driver_name: str
@@ -121,13 +124,63 @@ class HeadToHeadScoreCategoryResponse(BaseModel):
 
 
 class HeadToHeadScoreResponse(BaseModel):
+    score_type: str = "DRIVER_COMPARISON"
+    fantasy_points_awarded: int = 0
     driver_a_points: int
     driver_b_points: int
     winner_driver_number: str | None
     categories: list[HeadToHeadScoreCategoryResponse]
 
 
+class QualifyingComparisonResponse(BaseModel):
+    common_segment: str | None = None
+    driver_a_time_ms: int | None = None
+    driver_b_time_ms: int | None = None
+    driver_b_minus_driver_a_ms: int | None = None
+    disclaimer: str = "Gap uses the latest segment with valid times for both drivers."
+
+
+class SectorComparisonResponse(BaseModel):
+    sector: int
+    driver_a_median_ms: float | None
+    driver_b_median_ms: float | None
+    driver_a_sample_count: int
+    driver_b_sample_count: int
+    winner_driver_number: str | None
+
+
+class TelemetryLapCoverageResponse(BaseModel):
+    lap_id: UUID
+    lap_number: int
+    compound: str | None
+    sample_count: int
+
+
+class HeadToHeadTelemetryCoverage(BaseModel):
+    both_drivers_have_coverage: bool
+    driver_a_laps: list[TelemetryLapCoverageResponse]
+    driver_b_laps: list[TelemetryLapCoverageResponse]
+    disclaimer: str = (
+        "Candidates are clean laps with at least 50 complete, non-interpolated "
+        "car telemetry samples. "
+        "A selected pair must also pass the overlay's distance/time coverage "
+        "checks before traces are displayed."
+    )
+
+
+class HeadToHeadContextResponse(BaseModel):
+    race_control_events: list[RaceControlEventResponse]
+    events_truncated: bool
+    weather_sample_count: int
+    rainfall_observed: bool | None
+    data_quality_flags: list[str]
+
+
 class HeadToHeadResponse(BaseModel):
+    qualifying_comparison: QualifyingComparisonResponse | None = None
+    sector_comparisons: list[SectorComparisonResponse] = Field(default_factory=list)
+    telemetry_coverage: HeadToHeadTelemetryCoverage | None = None
+    race_context: HeadToHeadContextResponse | None = None
     comparison_version: str
 
     race_session_id: UUID

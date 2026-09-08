@@ -90,8 +90,11 @@ class ProfileContentService:
         *,
         query: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[DriverSummaryResponse]:
-        statement = select(Driver)
+        statement = select(Driver, DriverProfile).outerjoin(
+            DriverProfile, DriverProfile.driver_id == Driver.id
+        )
         normalized_query = (query or "").strip()
 
         if normalized_query:
@@ -106,22 +109,29 @@ class ProfileContentService:
                 )
             )
 
-        drivers = self.db.scalars(
+        drivers = self.db.execute(
             statement.order_by(
                 Driver.full_name.is_(None),
                 Driver.full_name,
                 Driver.driver_number,
-            ).limit(limit)
+                Driver.id,
+            ).offset(offset).limit(limit)
         ).all()
-        return [self._driver_summary(driver) for driver in drivers]
+        return [
+            self._driver_summary(driver, profile)
+            for driver, profile in drivers
+        ]
 
     def list_teams(
         self,
         *,
         query: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[TeamSummaryResponse]:
-        statement = select(Team)
+        statement = select(Team, TeamProfile).outerjoin(
+            TeamProfile, TeamProfile.team_id == Team.id
+        )
         normalized_query = (query or "").strip()
 
         if normalized_query:
@@ -129,10 +139,10 @@ class ProfileContentService:
                 Team.name.ilike(f"%{normalized_query}%")
             )
 
-        teams = self.db.scalars(
-            statement.order_by(Team.name).limit(limit)
+        teams = self.db.execute(
+            statement.order_by(Team.name, Team.id).offset(offset).limit(limit)
         ).all()
-        return [self._team_summary(team) for team in teams]
+        return [self._team_summary(team, profile) for team, profile in teams]
 
     def get_driver_profile(self, driver_id: UUID) -> DriverProfileResponse:
         driver = self._require_driver(driver_id)
@@ -149,7 +159,18 @@ class ProfileContentService:
         ).all()
 
         return DriverProfileResponse(
-            **self._driver_summary(driver).model_dump(),
+            **self._driver_summary(driver, profile).model_dump(),
+            details=profile.details if profile else None,
+            recorded_teams=[
+                self._team_summary(team)
+                for team in self.db.scalars(
+                    select(Team)
+                    .join(SessionResult, SessionResult.team_id == Team.id)
+                    .where(SessionResult.driver_id == driver_id)
+                    .distinct()
+                    .order_by(Team.name, Team.id)
+                ).all()
+            ],
             profile_id=profile.id if profile else None,
             biography=profile.biography if profile else None,
             attribution=(
@@ -175,7 +196,18 @@ class ProfileContentService:
         ).all()
 
         return TeamProfileResponse(
-            **self._team_summary(team).model_dump(),
+            **self._team_summary(team, profile).model_dump(),
+            details=profile.details if profile else None,
+            recorded_drivers=[
+                self._driver_summary(driver)
+                for driver in self.db.scalars(
+                    select(Driver)
+                    .join(SessionResult, SessionResult.driver_id == Driver.id)
+                    .where(SessionResult.team_id == team_id)
+                    .distinct()
+                    .order_by(Driver.full_name, Driver.id)
+                ).all()
+            ],
             profile_id=profile.id if profile else None,
             biography=profile.biography if profile else None,
             attribution=(
@@ -678,7 +710,9 @@ class ProfileContentService:
         return moment
 
     @staticmethod
-    def _driver_summary(driver: Driver) -> DriverSummaryResponse:
+    def _driver_summary(
+        driver: Driver, profile: DriverProfile | None = None,
+    ) -> DriverSummaryResponse:
         return DriverSummaryResponse(
             id=driver.id,
             driver_number=driver.driver_number,
@@ -688,15 +722,21 @@ class ProfileContentService:
             full_name=driver.full_name,
             country_code=driver.country_code,
             source=driver.source,
+            short_bio=profile.short_bio if profile else None,
+            avatar=profile.avatar if profile else None,
         )
 
     @staticmethod
-    def _team_summary(team: Team) -> TeamSummaryResponse:
+    def _team_summary(
+        team: Team, profile: TeamProfile | None = None,
+    ) -> TeamSummaryResponse:
         return TeamSummaryResponse(
             id=team.id,
             name=team.name,
             colour=team.colour,
             source=team.source,
+            short_bio=profile.short_bio if profile else None,
+            avatar=profile.avatar if profile else None,
         )
 
     @staticmethod
@@ -731,6 +771,14 @@ class ProfileContentService:
         payload: DriverProfileUpsertRequest | TeamProfileUpsertRequest,
     ) -> None:
         profile.biography = payload.biography
+        # Preserve new fields for older clients that only send a biography.
+        # Explicit null clears a field; supplied objects replace it in full.
+        for field in ("short_bio", "avatar", "details"):
+            if field in payload.model_fields_set:
+                value = getattr(payload, field)
+                if field != "short_bio" and value is not None:
+                    value = value.model_dump(mode="json")
+                setattr(profile, field, value)
         profile.source_url = payload.source_url
         profile.publisher = payload.publisher
         profile.published_at = payload.published_at

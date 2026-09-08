@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from urllib.parse import urlparse
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 class ContentConfidence(str, Enum):
@@ -66,8 +66,66 @@ class CuratedAttributionResponse(BaseModel):
     data_quality_flags: list[str]
 
 
-class DriverProfileUpsertRequest(CuratedAttributionInput):
+class ProfileAvatar(BaseModel):
+    """Client-rendered 3D asset; the API never fetches the remote model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_url: HttpUrl
+    poster_url: HttpUrl | None = None
+    alt_text: str = Field(min_length=1, max_length=240)
+    credit: str = Field(min_length=1, max_length=500)
+    auto_rotate: bool = True
+
+    @field_validator("model_url")
+    @classmethod
+    def validate_model_url(cls, value: HttpUrl) -> HttpUrl:
+        if not (value.path or "").lower().endswith(".glb"):
+            raise ValueError("Avatar model must be a self-contained .glb file.")
+        return value
+
+    @field_validator("alt_text", "credit")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("This field must not be blank.")
+        return value.strip()
+
+
+class ProfileDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    official_website: HttpUrl | None = None
+
+
+class DriverDetails(ProfileDetails):
+    date_of_birth: date | None = None
+    place_of_birth: str | None = Field(default=None, min_length=1, max_length=240)
+    nationality: str | None = Field(default=None, min_length=1, max_length=100)
+    debut_year: int | None = Field(default=None, ge=1950, le=2100)
+
+
+class TeamDetails(ProfileDetails):
+    full_name: str | None = Field(default=None, min_length=1, max_length=240)
+    base: str | None = Field(default=None, min_length=1, max_length=240)
+    team_principal: str | None = Field(default=None, min_length=1, max_length=240)
+    technical_director: str | None = Field(default=None, min_length=1, max_length=240)
+    chassis: str | None = Field(default=None, min_length=1, max_length=120)
+    power_unit: str | None = Field(default=None, min_length=1, max_length=120)
+    first_entry_year: int | None = Field(default=None, ge=1950, le=2100)
+
+
+class ProfileUpsertRequest(CuratedAttributionInput):
     biography: str = Field(min_length=1, max_length=20_000)
+    short_bio: str | None = Field(default=None, min_length=1, max_length=500)
+    avatar: ProfileAvatar | None = None
+
+    @field_validator("short_bio")
+    @classmethod
+    def normalize_short_bio(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Short biography must not be blank.")
+        return value.strip() if value is not None else None
 
     @field_validator("biography")
     @classmethod
@@ -80,8 +138,12 @@ class DriverProfileUpsertRequest(CuratedAttributionInput):
         return normalized
 
 
-class TeamProfileUpsertRequest(DriverProfileUpsertRequest):
-    pass
+class DriverProfileUpsertRequest(ProfileUpsertRequest):
+    details: DriverDetails | None = None
+
+
+class TeamProfileUpsertRequest(ProfileUpsertRequest):
+    details: TeamDetails | None = None
 
 
 class ProfileNotableMomentCreateRequest(CuratedAttributionInput):
@@ -166,6 +228,8 @@ class DriverSummaryResponse(BaseModel):
     full_name: str | None
     country_code: str | None
     source: str
+    short_bio: str | None = None
+    avatar: ProfileAvatar | None = None
 
 
 class TeamSummaryResponse(BaseModel):
@@ -173,9 +237,13 @@ class TeamSummaryResponse(BaseModel):
     name: str
     colour: str | None
     source: str
+    short_bio: str | None = None
+    avatar: ProfileAvatar | None = None
 
 
 class DriverProfileResponse(DriverSummaryResponse):
+    details: DriverDetails | None = None
+    recorded_teams: list[TeamSummaryResponse] = Field(default_factory=list)
     profile_id: UUID | None
     biography: str | None
     attribution: CuratedAttributionResponse | None
@@ -183,6 +251,8 @@ class DriverProfileResponse(DriverSummaryResponse):
 
 
 class TeamProfileResponse(TeamSummaryResponse):
+    details: TeamDetails | None = None
+    recorded_drivers: list[DriverSummaryResponse] = Field(default_factory=list)
     profile_id: UUID | None
     biography: str | None
     attribution: CuratedAttributionResponse | None
