@@ -490,3 +490,79 @@ def test_unavailable_telemetry_is_visible_without_blocking_other_data(
         s["stages"]["context"]["status"] == "COMPLETED"
         for s in weekend.sessions
     )
+
+
+@pytest.mark.parametrize("sprint", [False, True])
+def test_calendar_overview_links_downloaded_sessions_and_analytics(
+    db_session, api_client, sprint
+):
+    from app.schemas.calendar import CalendarWeekendInput
+    from app.services.calendar_service import CalendarService
+
+    service, provider, selected = selected_service(
+        db_session, FakeWeekendProvider(sprint=sprint)
+    )
+    data = CalendarWeekendInput(
+        year=2023,
+        round_number=14,
+        event_name="Italian Grand Prix",
+        source_url="https://example.com/schedule",
+        source_checked_at=datetime.now(UTC),
+        change_reason="Verified schedule",
+        sessions=[
+            dict(
+                identifier="SQ"
+                if session.identifier == "SS"
+                else session.identifier,
+                name=session.name,
+                starts_at=session.scheduled_at,
+            )
+            for session in provider.schedule.sessions
+        ],
+    )
+    calendar = CalendarService(db_session)
+    row = calendar.save(data, "editor")
+    assert all(not item["imported"] for item in row["sessions"])
+    service.run(selected.id)
+    downloaded = service.get(selected.id)
+    linked = calendar.save(
+        data.model_copy(update={"meeting_id": downloaded.meeting_id}),
+        "editor",
+        row["id"],
+        row["version"],
+    )
+    assert all(item["imported"] for item in linked["sessions"])
+    response = api_client.get(f"/api/v1/weekends/{row['id']}/overview")
+    assert response.status_code == 200
+    assert len(response.json()["sessions"]) == 5
+    race = next(
+        item for item in linked["sessions"] if item["identifier"] == "R"
+    )
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(Lap)
+            .where(Lap.race_session_id == race["race_session_id"])
+        )
+        == 4
+    )
+    laps = api_client.get(f"/api/v1/sessions/{race['race_session_id']}/laps")
+    assert laps.status_code == 200
+    assert len(laps.json()) == 4
+    insights = api_client.get(
+        f"/api/v1/sessions/{race['race_session_id']}/drivers/1/tyre-insights"
+    )
+    assert insights.status_code == 200, insights.text
+    # Schedule edits affect the calendar, preserving imported historical facts.
+    recorded_start = db_session.get(
+        RaceSession, race["race_session_id"]
+    ).started_at
+    moved = data.model_copy(
+        deep=True, update={"meeting_id": downloaded.meeting_id}
+    )
+    moved.sessions[-1].starts_at += timedelta(hours=1)
+    calendar.save(moved, "editor", row["id"], linked["version"])
+    assert (
+        db_session.get(RaceSession, race["race_session_id"]).started_at
+        == recorded_start
+    )

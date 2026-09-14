@@ -265,6 +265,7 @@ class EditorialUpdate(Base):
     """A sourced editorial update; it never mutates imported timing facts."""
 
     __tablename__ = "editorial_updates"
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "update_type IN ("

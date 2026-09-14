@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import dashboard
+from app.api.v1 import calendar, dashboard
 
 from app.api.v1 import (
     accounts,
@@ -37,6 +37,7 @@ api_router = APIRouter()
 api_router.include_router(dashboard.router)
 
 api_router.include_router(health.router)
+api_router.include_router(calendar.router)
 api_router.include_router(weekends.router)
 api_router.include_router(jobs.router)
 api_router.include_router(import_jobs.router)

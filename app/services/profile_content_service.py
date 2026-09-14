@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select
@@ -115,7 +116,9 @@ class ProfileContentService:
                 Driver.full_name,
                 Driver.driver_number,
                 Driver.id,
-            ).offset(offset).limit(limit)
+            )
+            .offset(offset)
+            .limit(limit)
         ).all()
         return [
             self._driver_summary(driver, profile)
@@ -174,11 +177,11 @@ class ProfileContentService:
             profile_id=profile.id if profile else None,
             biography=profile.biography if profile else None,
             attribution=(
-                self._attribution(profile)
-                if profile is not None
-                else None
+                self._attribution(profile) if profile is not None else None
             ),
-            notable_moments=[self._moment_response(moment) for moment in moments],
+            notable_moments=[
+                self._moment_response(moment) for moment in moments
+            ],
         )
 
     def get_team_profile(self, team_id: UUID) -> TeamProfileResponse:
@@ -211,11 +214,11 @@ class ProfileContentService:
             profile_id=profile.id if profile else None,
             biography=profile.biography if profile else None,
             attribution=(
-                self._attribution(profile)
-                if profile is not None
-                else None
+                self._attribution(profile) if profile is not None else None
             ),
-            notable_moments=[self._moment_response(moment) for moment in moments],
+            notable_moments=[
+                self._moment_response(moment) for moment in moments
+            ],
         )
 
     def upsert_driver_profile(
@@ -448,7 +451,9 @@ class ProfileContentService:
             statement = statement.where(Meeting.year == year)
 
         return self.db.execute(
-            statement.order_by(Meeting.year, Meeting.event_date, RaceSession.id)
+            statement.order_by(
+                Meeting.year, Meeting.event_date, RaceSession.id
+            )
         ).all()
 
     def _team_result_rows(
@@ -473,7 +478,9 @@ class ProfileContentService:
             statement = statement.where(Meeting.year == year)
 
         return self.db.execute(
-            statement.order_by(Meeting.year, Meeting.event_date, RaceSession.id)
+            statement.order_by(
+                Meeting.year, Meeting.event_date, RaceSession.id
+            )
         ).all()
 
     def _driver_lap_rows(
@@ -486,9 +493,7 @@ class ProfileContentService:
                 Meeting.year.label("year"),
                 func.count(Lap.id).label("lap_count"),
                 func.coalesce(
-                    func.sum(
-                        case((Lap.position == 1, 1), else_=0)
-                    ),
+                    func.sum(case((Lap.position == 1, 1), else_=0)),
                     0,
                 ).label("laps_led"),
             )
@@ -522,9 +527,7 @@ class ProfileContentService:
                 Meeting.year.label("year"),
                 func.count(Lap.id).label("lap_count"),
                 func.coalesce(
-                    func.sum(
-                        case((Lap.position == 1, 1), else_=0)
-                    ),
+                    func.sum(case((Lap.position == 1, 1), else_=0)),
                     0,
                 ).label("laps_led"),
             )
@@ -534,8 +537,7 @@ class ProfileContentService:
             .join(
                 SessionResult,
                 and_(
-                    SessionResult.race_session_id
-                    == Lap.race_session_id,
+                    SessionResult.race_session_id == Lap.race_session_id,
                     SessionResult.driver_id == Lap.driver_id,
                 ),
             )
@@ -639,9 +641,8 @@ class ProfileContentService:
         result: SessionResult,
     ) -> None:
         stats["race_entries"] = int(stats["race_entries"]) + 1
-        stats["points"] = (
-            Decimal(stats["points"])
-            + (result.points if result.points is not None else Decimal("0"))
+        stats["points"] = Decimal(stats["points"]) + (
+            result.points if result.points is not None else Decimal("0")
         )
 
         if result.position is None or result.position < 1:
@@ -711,7 +712,8 @@ class ProfileContentService:
 
     @staticmethod
     def _driver_summary(
-        driver: Driver, profile: DriverProfile | None = None,
+        driver: Driver,
+        profile: DriverProfile | None = None,
     ) -> DriverSummaryResponse:
         return DriverSummaryResponse(
             id=driver.id,
@@ -728,7 +730,8 @@ class ProfileContentService:
 
     @staticmethod
     def _team_summary(
-        team: Team, profile: TeamProfile | None = None,
+        team: Team,
+        profile: TeamProfile | None = None,
     ) -> TeamSummaryResponse:
         return TeamSummaryResponse(
             id=team.id,
@@ -831,6 +834,9 @@ class EditorialContentService:
         driver_id: UUID | None,
         team_id: UUID | None,
         limit: int,
+        offset: int = 0,
+        category: str | None = None,
+        calendar_weekend_id: UUID | None = None,
     ) -> list[EditorialUpdateResponse]:
         return self._list_updates(
             update_type=update_type,
@@ -840,6 +846,10 @@ class EditorialContentService:
             driver_id=driver_id,
             team_id=team_id,
             limit=limit,
+            public_only=True,
+            offset=offset,
+            category=category,
+            calendar_weekend_id=calendar_weekend_id,
         )
 
     def list_editor_updates(
@@ -873,13 +883,32 @@ class EditorialContentService:
         driver_id: UUID | None,
         team_id: UUID | None,
         limit: int,
+        public_only: bool = False,
+        offset: int = 0,
+        category: str | None = None,
+        calendar_weekend_id: UUID | None = None,
     ) -> list[EditorialUpdateResponse]:
         statement = select(EditorialUpdate)
+        if category:
+            statement = statement.where(
+                func.coalesce(
+                    EditorialUpdate.context["category"].as_string(), "GENERAL"
+                )
+                == category
+            )
+        if calendar_weekend_id:
+            statement = statement.where(
+                EditorialUpdate.context["calendar_weekend_id"].as_string()
+                == str(calendar_weekend_id)
+            )
 
         if publication_status is not None:
             statement = statement.where(
-                EditorialUpdate.publication_status
-                == publication_status.value
+                EditorialUpdate.publication_status == publication_status.value
+            )
+        if public_only:
+            statement = statement.where(
+                EditorialUpdate.published_at <= datetime.now(UTC)
             )
         if update_type is not None:
             statement = statement.where(
@@ -894,9 +923,7 @@ class EditorialContentService:
                 EditorialUpdate.race_session_id == race_session_id
             )
         if driver_id is not None:
-            statement = statement.where(
-                EditorialUpdate.driver_id == driver_id
-            )
+            statement = statement.where(EditorialUpdate.driver_id == driver_id)
         if team_id is not None:
             statement = statement.where(EditorialUpdate.team_id == team_id)
 
@@ -904,7 +931,10 @@ class EditorialContentService:
             statement.order_by(
                 EditorialUpdate.published_at.desc(),
                 EditorialUpdate.created_at.desc(),
-            ).limit(limit)
+                EditorialUpdate.id.desc(),
+            )
+            .offset(offset)
+            .limit(limit)
         ).all()
         return [self._response(update) for update in updates]
 
@@ -913,6 +943,7 @@ class EditorialContentService:
             select(EditorialUpdate).where(
                 EditorialUpdate.id == update_id,
                 EditorialUpdate.publication_status == "PUBLISHED",
+                EditorialUpdate.published_at <= datetime.now(UTC),
             )
         )
         if update is None:
@@ -925,6 +956,7 @@ class EditorialContentService:
         payload: EditorialUpdateCreateRequest,
         editor_profile_id: UUID,
     ) -> EditorialUpdateResponse:
+        self._validate_context(payload.context)
         self._validate_associations(
             meeting_id=payload.meeting_id,
             race_session_id=payload.race_session_id,
@@ -932,6 +964,7 @@ class EditorialContentService:
             team_id=payload.team_id,
         )
         update = EditorialUpdate(
+            context=payload.context.model_dump(mode="json"),
             update_type=payload.update_type.value,
             publication_status=payload.publication_status.value,
             title=payload.title,
@@ -962,6 +995,13 @@ class EditorialContentService:
     ) -> EditorialUpdateResponse:
         update = self._require_update(update_id)
         values = payload.model_dump(exclude_unset=True)
+        if "context" in values:
+            if payload.context is None:
+                raise ProfileContentValidationError(
+                    "Context cannot be cleared."
+                )
+            self._validate_context(payload.context)
+            values["context"] = payload.context.model_dump(mode="json")
 
         required_fields = {
             "update_type",
@@ -1036,6 +1076,16 @@ class EditorialContentService:
                 "The race session does not belong to the supplied meeting."
             )
 
+    def _validate_context(self, context):
+        from app.models.calendar import CalendarWeekend
+
+        if (
+            context.calendar_weekend_id
+            and self.db.get(CalendarWeekend, context.calendar_weekend_id)
+            is None
+        ):
+            raise EditorialAssociationError("Calendar weekend not found.")
+
     def _require_update(self, update_id: UUID) -> EditorialUpdate:
         update = self.db.get(EditorialUpdate, update_id)
         if update is None:
@@ -1045,6 +1095,7 @@ class EditorialContentService:
     @staticmethod
     def _response(update: EditorialUpdate) -> EditorialUpdateResponse:
         return EditorialUpdateResponse(
+            context=update.context or {},
             id=update.id,
             update_type=EditorialUpdateType(update.update_type),
             publication_status=EditorialPublicationStatus(

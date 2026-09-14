@@ -1,3 +1,4 @@
+from app.models.calendar import CalendarRevision, CalendarSyncState, CalendarWeekend
 from app.models.curated_content import (
     DriverProfile,
     EditorialUpdate,
@@ -36,6 +37,9 @@ from app.models.weather_sample import WeatherSample
 from app.models.weekend_download import WeekendDownload
 
 __all__ = [
+    "CalendarRevision",
+    "CalendarSyncState",
+    "CalendarWeekend",
     "DriverProfile",
     "EditorialUpdate",
     "Driver",
