@@ -22,7 +22,10 @@ licensing review.
   treats it as an external service; an explicitly enabled local-only profile
   is available for development.
 
-See the [API guide](docs/api-guide.md),
+See the [race calendar and Paddock guide](docs/race-calendar.md),
+[API guide](docs/api-guide.md),
+[personalized alerts](docs/personalized-alerts.md),
+[Fantasy guest testing](docs/fantasy-guest-testing.md),
 [architecture](docs/architecture.md),
 [data-source rules](docs/data-sources.md), and
 [Keycloak operational checklist](docs/keycloak-user-backend-setup.md).
@@ -94,7 +97,7 @@ the API and worker.
 ```powershell
 docker compose --env-file .env -f infra/docker-compose.yml up -d --build postgres redis
 docker compose --env-file .env -f infra/docker-compose.yml --profile migrate run --rm migrate
-docker compose --env-file .env -f infra/docker-compose.yml up -d api worker
+docker compose --env-file .env -f infra/docker-compose.yml up -d api worker calendar-sync
 docker compose --env-file .env -f infra/docker-compose.yml ps
 ```
 

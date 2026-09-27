@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from secrets import token_urlsafe
 from uuid import UUID
@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
+from app.services.calendar_service import calendar_identifier, fantasy_schedule
 from app.models.fantasy import (
     FantasyEntryStatus,
     FantasyGroup,
@@ -1099,6 +1100,20 @@ class FantasyService:
         context: FantasyRaceContext,
     ) -> list[FantasyQuestionDefinition]:
         derived_questions = self._derived_questions_for_context(context)
+        schedule = fantasy_schedule(self.db, context.meeting.id)
+        identifiers = {
+            s.id: calendar_identifier(s.session_identifier)
+            for s in context.sessions
+        }
+        derived_questions = [
+            replace(
+                question,
+                locks_at=schedule[identifiers[question.target_session_id]],
+            )
+            if identifiers.get(question.target_session_id) in schedule
+            else question
+            for question in derived_questions
+        ]
         snapshots = self.db.scalars(
             select(FantasyWeekendQuestion)
             .where(
@@ -1143,9 +1158,16 @@ class FantasyService:
                 FantasyWeekendQuestionStatus.RESOLVED,
                 FantasyWeekendQuestionStatus.NOT_SCORED,
             }:
+                if identifiers.get(question.target_session_id) in schedule:
+                    snapshot.locks_at = question.locks_at
                 snapshot.status = self._snapshot_status_for_lock(
                     snapshot.locks_at
                 )
+                if (
+                    identifiers.get(question.target_session_id) in schedule
+                    and question.locks_at is None
+                ):
+                    snapshot.status = FantasyWeekendQuestionStatus.UNAVAILABLE
 
         self.db.flush()
         snapshots.sort(
@@ -1155,13 +1177,16 @@ class FantasyService:
             )
         )
 
-        return [
-            self._definition_from_snapshot(
-                snapshot,
-                derived_by_key.get(snapshot.question_key),
+        definitions = []
+        for snapshot in snapshots:
+            definition = self._definition_from_snapshot(
+                snapshot, derived_by_key.get(snapshot.question_key)
             )
-            for snapshot in snapshots
-        ]
+            identifier = identifiers.get(snapshot.target_session_id)
+            if identifier in schedule and schedule[identifier] is None:
+                definition = replace(definition, locks_at=None)
+            definitions.append(definition)
+        return definitions
 
     def _definition_from_snapshot(
         self,

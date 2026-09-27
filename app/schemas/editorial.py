@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.profiles import ContentConfidence
+from app.schemas.paddock import PaddockContext
 
 
 class EditorialUpdateType(str, Enum):
@@ -26,6 +27,7 @@ class EditorialPublicationStatus(str, Enum):
 
 
 class EditorialUpdateCreateRequest(BaseModel):
+    context: PaddockContext = Field(default_factory=PaddockContext)
     update_type: EditorialUpdateType
     publication_status: EditorialPublicationStatus = (
         EditorialPublicationStatus.DRAFT
@@ -80,6 +82,7 @@ class EditorialUpdateCreateRequest(BaseModel):
 
 
 class EditorialUpdateUpdateRequest(BaseModel):
+    context: PaddockContext | None = None
     update_type: EditorialUpdateType | None = None
     publication_status: EditorialPublicationStatus | None = None
     title: str | None = Field(default=None, min_length=1, max_length=240)
@@ -126,10 +129,13 @@ class EditorialUpdateUpdateRequest(BaseModel):
         if values is None:
             return None
 
-        return EditorialUpdateCreateRequest.normalize_data_quality_flags(values)
+        return EditorialUpdateCreateRequest.normalize_data_quality_flags(
+            values
+        )
 
 
 class EditorialUpdateResponse(BaseModel):
+    context: PaddockContext = Field(default_factory=PaddockContext)
     id: UUID
     update_type: EditorialUpdateType
     publication_status: EditorialPublicationStatus

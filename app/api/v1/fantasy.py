@@ -1,6 +1,7 @@
 from typing import NoReturn
 from uuid import UUID
 
+from pydantic import BaseModel
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -20,7 +21,12 @@ from app.core.redis import (
     RedisUnavailableError,
     ensure_redis_available,
 )
-from app.core.rate_limit import expensive_request_rate_limit
+from app.core.rate_limit import (
+    expensive_request_rate_limit,
+    registration_rate_limit,
+)
+from app.core.config import settings
+from app.core.fantasy_guest import create_guest, get_fantasy_fan
 from app.core.security import (
     AuthenticatedUser,
     authenticate_access_token,
@@ -76,6 +82,23 @@ from app.websocket.fantasy_streamer import FantasyStreamer
 router = APIRouter(prefix="/fantasy", tags=["Fantasy"])
 
 
+class FantasyGuestSessionResponse(BaseModel):
+    guest_key: str
+
+
+@router.post(
+    "/guest-session",
+    response_model=FantasyGuestSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a temporary Fantasy guest session for development",
+)
+def create_fantasy_guest_session(
+    _: None = Depends(registration_rate_limit),
+    db: Session = Depends(get_db),
+) -> FantasyGuestSessionResponse:
+    return FantasyGuestSessionResponse(guest_key=create_guest(db))
+
+
 @router.get(
     "/races",
     response_model=list[FantasyRaceSummaryResponse],
@@ -83,9 +106,7 @@ router = APIRouter(prefix="/fantasy", tags=["Fantasy"])
 )
 def list_fantasy_races(
     year: int | None = Query(default=None, ge=1950, le=2100),
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> list[FantasyRaceSummaryResponse]:
     del current_user
@@ -99,9 +120,7 @@ def list_fantasy_races(
 )
 def get_fantasy_dashboard(
     year: int | None = Query(default=None, ge=1950, le=2100),
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyDashboardResponse:
     profile_id = _profile_id(db, current_user)
@@ -118,9 +137,7 @@ def get_fantasy_dashboard(
 )
 def get_prediction(
     race_session_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyPredictionResponse:
     try:
@@ -140,9 +157,7 @@ def get_prediction(
 )
 def get_entry_progress(
     race_session_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyEntryProgressResponse:
     try:
@@ -163,9 +178,7 @@ def get_entry_progress(
 def save_prediction(
     race_session_id: UUID,
     payload: FantasyPredictionUpdateRequest,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyPredictionResponse:
     try:
@@ -188,9 +201,7 @@ def save_question(
     race_session_id: UUID,
     question_key: str,
     payload: FantasyQuestionSaveRequest,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyQuestionSaveResponse:
     try:
@@ -213,9 +224,7 @@ def save_question(
 def get_community_percentages(
     race_session_id: UUID,
     question_key: str,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyCommunityResponse:
     try:
@@ -239,9 +248,7 @@ def score_questions(
     background_tasks: BackgroundTasks,
     request: Request,
     _: None = Depends(expensive_request_rate_limit),
-    current_user: AuthenticatedUser = Depends(
-        require_roles("editor")
-    ),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> FantasyScoreRunResponse:
     del current_user
@@ -256,12 +263,8 @@ def score_questions(
             race_session_id,
             "fantasy.questions_scored",
             {
-                "resolved_question_keys": (
-                    response.resolved_question_keys
-                ),
-                "pending_question_keys": (
-                    response.pending_question_keys
-                ),
+                "resolved_question_keys": (response.resolved_question_keys),
+                "pending_question_keys": (response.pending_question_keys),
             },
         )
         return response
@@ -292,9 +295,7 @@ def queue_fantasy_scoring(
         job_type=DurableJobType.FANTASY_SCORE,
         target_id=race_session_id,
         idempotency_key=(
-            f"fantasy-score:{idempotency_key}"
-            if idempotency_key
-            else None
+            f"fantasy-score:{idempotency_key}" if idempotency_key else None
         ),
         payload={"race_session_id": str(race_session_id)},
     )
@@ -311,9 +312,7 @@ def set_question_resolution(
     payload: FantasyQuestionResolutionRequest,
     background_tasks: BackgroundTasks,
     request: Request,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("editor")
-    ),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> FantasyQuestionResolutionResponse:
     try:
@@ -349,26 +348,20 @@ def finalize_weekend(
     background_tasks: BackgroundTasks,
     request: Request,
     _: None = Depends(expensive_request_rate_limit),
-    current_user: AuthenticatedUser = Depends(
-        require_roles("editor")
-    ),
+    current_user: AuthenticatedUser = Depends(require_roles("editor")),
     db: Session = Depends(get_db),
 ) -> FantasyFinalizeResponse:
     del current_user
 
     try:
-        response = FantasyService(db).finalize_weekend(
-            race_session_id
-        )
+        response = FantasyService(db).finalize_weekend(race_session_id)
         _publish_event(
             background_tasks,
             request,
             race_session_id,
             "fantasy.weekend_finalized",
             {
-                "finalized_group_count": (
-                    response.finalized_group_count
-                ),
+                "finalized_group_count": (response.finalized_group_count),
             },
         )
         return response
@@ -399,9 +392,7 @@ def queue_fantasy_finalization(
         job_type=DurableJobType.FANTASY_FINALIZE,
         target_id=race_session_id,
         idempotency_key=(
-            f"fantasy-finalize:{idempotency_key}"
-            if idempotency_key
-            else None
+            f"fantasy-finalize:{idempotency_key}" if idempotency_key else None
         ),
         payload={"race_session_id": str(race_session_id)},
     )
@@ -415,9 +406,7 @@ def queue_fantasy_finalization(
 def get_global_leaderboard(
     year: int | None = Query(default=None, ge=1950, le=2100),
     race_session_id: UUID | None = None,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyLeaderboardResponse:
     try:
@@ -439,9 +428,7 @@ def get_global_leaderboard(
 )
 def create_group(
     payload: FantasyGroupCreateRequest,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyGroupDetailResponse:
     profile_id = _profile_id(db, current_user)
@@ -454,9 +441,7 @@ def create_group(
     summary="List the current user's Fantasy groups",
 )
 def list_groups(
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> list[FantasyGroupSummaryResponse]:
     profile_id = _profile_id(db, current_user)
@@ -470,9 +455,7 @@ def list_groups(
 )
 def join_group(
     payload: FantasyGroupJoinRequest,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyGroupDetailResponse:
     try:
@@ -489,9 +472,7 @@ def join_group(
 )
 def get_group(
     group_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyGroupDetailResponse:
     try:
@@ -511,9 +492,7 @@ def get_group(
 )
 def rotate_group_invite_code(
     group_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyGroupInviteCodeResponse:
     try:
@@ -534,9 +513,7 @@ def rotate_group_invite_code(
 def remove_group_member(
     group_id: UUID,
     member_profile_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> None:
     try:
@@ -559,9 +536,7 @@ def get_group_leaderboard(
     group_id: UUID,
     year: int | None = Query(default=None, ge=1950, le=2100),
     race_session_id: UUID | None = None,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyLeaderboardResponse:
     try:
@@ -584,9 +559,7 @@ def get_group_leaderboard(
 def get_group_podium(
     group_id: UUID,
     race_session_id: UUID,
-    current_user: AuthenticatedUser = Depends(
-        require_roles("fan")
-    ),
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
     db: Session = Depends(get_db),
 ) -> FantasyGroupPodiumResponse:
     try:
@@ -645,6 +618,8 @@ async def stream_fantasy_updates(
 
 def _is_authorized_fantasy_stream(websocket: WebSocket) -> bool:
     authorization = websocket.headers.get("authorization")
+    if not authorization and settings.fantasy_guest_access_enabled:
+        return True
     scheme, _, access_token = (authorization or "").partition(" ")
 
     if scheme.casefold() != "bearer" or not access_token.strip():
@@ -666,9 +641,9 @@ def _profile_id(
     db: Session,
     current_user: AuthenticatedUser,
 ) -> UUID:
-    return UserProfileService(db).get_or_create_profile(
-        current_user
-    ).profile_id
+    return (
+        UserProfileService(db).get_or_create_profile(current_user).profile_id
+    )
 
 
 def _publish_event(
@@ -744,9 +719,7 @@ def _fantasy_http_error(error: FantasyError) -> NoReturn:
             detail["question_keys"] = error.question_keys
 
         if isinstance(error, FantasyResolutionStateError):
-            detail["pending_question_keys"] = (
-                error.pending_question_keys
-            )
+            detail["pending_question_keys"] = error.pending_question_keys
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

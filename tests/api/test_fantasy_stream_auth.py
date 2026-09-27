@@ -3,10 +3,20 @@ from types import SimpleNamespace
 from fastapi import HTTPException, status
 
 from app.api.v1 import fantasy
+from app.core.config import settings
 from app.core.security import AuthenticatedUser
 
 
-def test_fantasy_stream_rejects_a_missing_bearer_header() -> None:
+def test_fantasy_stream_accepts_guests_in_development() -> None:
+    websocket = SimpleNamespace(headers={})
+
+    assert fantasy._is_authorized_fantasy_stream(websocket) is True
+
+
+def test_fantasy_stream_requires_login_outside_development(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
     websocket = SimpleNamespace(headers={})
 
     assert fantasy._is_authorized_fantasy_stream(websocket) is False

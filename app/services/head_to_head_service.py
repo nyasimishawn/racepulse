@@ -4,7 +4,7 @@ from collections import defaultdict
 from statistics import median
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.analytics.compound_pace import (
@@ -18,6 +18,11 @@ from app.models.meeting import Meeting
 from app.models.race_session import RaceSession
 from app.models.session_result import SessionResult
 from app.models.team import Team
+from app.models.telemetry_point import TelemetryPoint
+from app.models.race_control_event import RaceControlEvent
+from app.models.weather_sample import WeatherSample
+from app.services.race_context_service import RaceContextService
+from app.schemas.race_context import RaceControlEventResponse
 from app.schemas.head_to_head import (
     HeadToHeadDriverResponse,
     HeadToHeadPaceDeltaResponse,
@@ -30,6 +35,11 @@ from app.schemas.head_to_head import (
     HeadToHeadScoreResponse,
     HeadToHeadSharedCompoundPaceResponse,
     HeadToHeadStintResponse,
+    HeadToHeadContextResponse,
+    HeadToHeadTelemetryCoverage,
+    QualifyingComparisonResponse,
+    SectorComparisonResponse,
+    TelemetryLapCoverageResponse,
 )
 
 
@@ -141,6 +151,12 @@ class HeadToHeadService:
         )
 
         return HeadToHeadResponse(
+            qualifying_comparison=self._qualifying_comparison(
+                qualifying_results.get(driver_a.id), qualifying_results.get(driver_b.id),
+            ),
+            sector_comparisons=self._sectors(clean_a, clean_b, driver_a_number, driver_b_number),
+            telemetry_coverage=self._telemetry_coverage(race_session_id, clean_a, clean_b),
+            race_context=self._race_context(race_session_id, driver_a_number, driver_b_number),
             comparison_version="head-to-head-v1",
             race_session_id=race_session.id,
             meeting_id=meeting.id,
@@ -310,6 +326,9 @@ class HeadToHeadService:
                 team_name=team.name if team else None,
                 team_colour=team.colour if team else None,
                 race_result=HeadToHeadRaceResultResponse(
+                    positions_gained=(result.grid_position - result.position
+                        if result.grid_position is not None and result.grid_position > 0
+                        and result.position is not None and result.position > 0 else None),
                     finishing_position=result.position,
                     classified_position=result.classified_position,
                     grid_position=result.grid_position,
@@ -324,9 +343,95 @@ class HeadToHeadService:
                 pace=pace,
                 stints=self._stints(laps),
                 pit_stop_proxy=self._pit_proxy(laps),
+                pit_events=RaceContextService(self.db).list_pit_events(
+                    race_session_id=result.race_session_id, driver_number=driver.driver_number,
+                ),
                 data_quality_flags=sorted(flags),
             ),
             clean_laps,
+        )
+
+    @staticmethod
+    def _qualifying_comparison(result_a, result_b):
+        if result_a is not None and result_b is not None:
+            for segment in ("q3", "q2", "q1"):
+                a, b = (getattr(result, f"{segment}_time_ms")
+                        for result in (result_a, result_b))
+                if a is not None and b is not None and a > 0 and b > 0:
+                    return QualifyingComparisonResponse(
+                        common_segment=segment.upper(), driver_a_time_ms=a,
+                        driver_b_time_ms=b, driver_b_minus_driver_a_ms=b - a,
+                    )
+        return QualifyingComparisonResponse()
+
+    @staticmethod
+    def _sectors(clean_a, clean_b, number_a, number_b):
+        sectors = []
+        for sector in (1, 2, 3):
+            field = f"sector_{sector}_time_ms"
+            a, b = ([getattr(lap, field) for lap in laps
+                     if getattr(lap, field) is not None and getattr(lap, field) > 0]
+                    for laps in (clean_a, clean_b))
+            a_median, b_median = (float(median(values)) if values else None
+                                  for values in (a, b))
+            winner = None
+            if len(a) >= 3 and len(b) >= 3 and a_median != b_median:
+                winner = number_a if a_median < b_median else number_b
+            sectors.append(SectorComparisonResponse(
+                sector=sector, driver_a_median_ms=a_median, driver_b_median_ms=b_median,
+                driver_a_sample_count=len(a), driver_b_sample_count=len(b),
+                winner_driver_number=winner,
+            ))
+        return sectors
+
+    def _telemetry_coverage(self, session_id, clean_a, clean_b):
+        counts = dict(self.db.execute(
+            select(TelemetryPoint.lap_id, func.count(TelemetryPoint.id))
+            .where(
+                TelemetryPoint.race_session_id == session_id,
+                TelemetryPoint.is_interpolated.is_(False),
+                func.lower(TelemetryPoint.sample_source) == "car",
+                TelemetryPoint.distance_m.is_not(None),
+                TelemetryPoint.relative_time_ms.is_not(None),
+                TelemetryPoint.speed_kph.is_not(None),
+                TelemetryPoint.throttle_percentage.is_not(None),
+                TelemetryPoint.brake_applied.is_not(None),
+            )
+            .group_by(TelemetryPoint.lap_id)
+            .having(func.count(TelemetryPoint.id) >= 50)
+        ).all())
+        def candidates(laps):
+            return [TelemetryLapCoverageResponse(
+                lap_id=lap.id, lap_number=lap.lap_number,
+                compound=lap.compound, sample_count=counts[lap.id],
+            ) for lap in laps if lap.id in counts]
+        a, b = candidates(clean_a), candidates(clean_b)
+        return HeadToHeadTelemetryCoverage(
+            both_drivers_have_coverage=bool(a and b), driver_a_laps=a, driver_b_laps=b,
+        )
+
+    def _race_context(self, session_id, number_a, number_b):
+        events = self.db.scalars(select(RaceControlEvent).where(
+            RaceControlEvent.race_session_id == session_id,
+            or_(RaceControlEvent.driver_number.is_(None),
+                RaceControlEvent.driver_number.in_([number_a, number_b])),
+        ).order_by(RaceControlEvent.occurred_at, RaceControlEvent.id).limit(101)).all()
+        weather_count, rain_count, known_rain = self.db.execute(select(
+            func.count(WeatherSample.id),
+            func.count(WeatherSample.id).filter(WeatherSample.rainfall.is_(True)),
+            func.count(WeatherSample.rainfall),
+        ).where(WeatherSample.race_session_id == session_id)).one()
+        flags = []
+        if not events:
+            flags.append("RACE_CONTROL_NOT_AVAILABLE")
+        if not weather_count:
+            flags.append("WEATHER_NOT_AVAILABLE")
+        return HeadToHeadContextResponse(
+            race_control_events=[RaceControlEventResponse.model_validate(event, from_attributes=True)
+                                 for event in events[:100]],
+            events_truncated=len(events) > 100, weather_sample_count=weather_count,
+            rainfall_observed=bool(rain_count) if known_rain else None,
+            data_quality_flags=flags,
         )
 
     def _pace(
@@ -784,6 +889,7 @@ class HeadToHeadService:
     def _is_clean_lap(lap: Lap) -> bool:
         return (
             lap.lap_time_ms is not None
+            and lap.lap_time_ms > 0
             and lap.track_status == "1"
             and lap.is_accurate is True
             and lap.deleted is not True

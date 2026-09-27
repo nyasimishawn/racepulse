@@ -81,6 +81,9 @@ def test_profile_reads_are_public_and_history_declares_coverage(
 
     assert driver_response.status_code == 200
     assert driver_response.json()["biography"] is None
+    assert driver_response.json()["recorded_teams"][0]["id"] == str(team.id)
+    team_response = api_client.get(f"/api/v1/teams/{team.id}")
+    assert team_response.json()["recorded_drivers"][0]["id"] == str(driver.id)
     assert history_response.status_code == 200
     assert history_response.json()["totals"]["wins"] == 1
     assert history_response.json()["coverage"][

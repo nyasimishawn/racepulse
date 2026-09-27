@@ -50,6 +50,11 @@ x-racepulse-app: &racepulse-app
       condition: service_healthy
 
 services:
+  calendar-sync:
+    <<: *racepulse-app
+    restart: unless-stopped
+    command: [python, -m, app.workers.calendar_sync_worker]
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

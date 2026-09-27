@@ -41,11 +41,13 @@ router = APIRouter(tags=["Profiles"])
 def list_drivers(
     query: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=100, ge=1, le=250),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[DriverSummaryResponse]:
     return ProfileContentService(db).list_drivers(
         query=query,
         limit=limit,
+        offset=offset,
     )
 
 
@@ -178,11 +180,13 @@ def delete_driver_notable_moment(
 def list_teams(
     query: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=100, ge=1, le=250),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[TeamSummaryResponse]:
     return ProfileContentService(db).list_teams(
         query=query,
         limit=limit,
+        offset=offset,
     )
 
 

@@ -3,7 +3,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.core.security import AuthenticatedUser, get_current_user
+from app.core.fantasy_guest import get_fantasy_fan
+from app.core.security import AuthenticatedUser
 from app.main import app
 from app.models.driver import Driver
 from app.models.meeting import Meeting
@@ -14,7 +15,7 @@ from app.models.team import Team
 
 @pytest.fixture()
 def fantasy_client(api_client: TestClient) -> TestClient:
-    app.dependency_overrides[get_current_user] = lambda: (
+    app.dependency_overrides[get_fantasy_fan] = lambda: (
         AuthenticatedUser(
             subject="fantasy-api-player",
             username="fantasy-player",

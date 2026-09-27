@@ -13,6 +13,7 @@ from app.schemas.editorial import (
     EditorialUpdateType,
     EditorialUpdateUpdateRequest,
 )
+from app.schemas.paddock import NewsCategory
 from app.services.profile_content_service import (
     EditorialAssociationError,
     EditorialContentService,
@@ -32,6 +33,9 @@ router = APIRouter(prefix="/editorial/updates", tags=["Editorial"])
     summary="List published FIA, team, Pirelli, and race editorial updates",
 )
 def list_editorial_updates(
+    category: NewsCategory | None = None,
+    calendar_weekend_id: UUID | None = None,
+    offset: int = Query(default=0, ge=0, le=10000),
     update_type: EditorialUpdateType | None = None,
     meeting_id: UUID | None = None,
     race_session_id: UUID | None = None,
@@ -41,6 +45,9 @@ def list_editorial_updates(
     db: Session = Depends(get_db),
 ) -> list[EditorialUpdateResponse]:
     return EditorialContentService(db).list_public_updates(
+        category=category,
+        calendar_weekend_id=calendar_weekend_id,
+        offset=offset,
         update_type=update_type,
         meeting_id=meeting_id,
         race_session_id=race_session_id,
@@ -152,7 +159,9 @@ def delete_editorial_update(
 
 
 def _profile_id(db: Session, current_user: AuthenticatedUser) -> UUID:
-    return UserProfileService(db).get_or_create_profile(current_user).profile_id
+    return (
+        UserProfileService(db).get_or_create_profile(current_user).profile_id
+    )
 
 
 def _editorial_http_error(error: ProfileContentError) -> NoReturn:

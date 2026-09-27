@@ -48,6 +48,9 @@ class DriverProfile(Base):
         index=True,
     )
     biography: Mapped[str] = mapped_column(Text, nullable=False)
+    short_bio: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    avatar: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     source_url: Mapped[str] = mapped_column(
         String(1000),
@@ -118,6 +121,9 @@ class TeamProfile(Base):
         index=True,
     )
     biography: Mapped[str] = mapped_column(Text, nullable=False)
+    short_bio: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    avatar: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     source_url: Mapped[str] = mapped_column(
         String(1000),
@@ -259,6 +265,7 @@ class EditorialUpdate(Base):
     """A sourced editorial update; it never mutates imported timing facts."""
 
     __tablename__ = "editorial_updates"
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "update_type IN ("

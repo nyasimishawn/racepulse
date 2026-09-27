@@ -1,0 +1,60 @@
+name: Backend checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: racepulse
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: racepulse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U racepulse"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://racepulse:test-only-password@localhost:5432/racepulse
+      REDIS_URL: redis://localhost:6379/0
+      KEYCLOAK_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m ruff check app tests --no-cache
+      - run: python -m pytest -q -p no:cacheprovider
+      - name: PostgreSQL migrations, calendar, Fantasy, imports and Redis
+        run: >-
+          python -m pytest -q -p no:cacheprovider --postgresql
+          tests/integration
+          tests/api/test_calendar_api.py
+          tests/api/test_paddock_api.py
+          tests/api/test_fantasy_api.py
+          tests/api/test_weekends_api.py
+          tests/services/test_calendar_deadlines.py
+          tests/services/test_calendar_sync_service.py
+          tests/services/test_durable_job_service.py
+          tests/services/test_weekend_download_service.py
+          tests/api/test_alerts_api.py
+          tests/api/test_fantasy_guest_api.py
+          tests/services/test_alert_service.py

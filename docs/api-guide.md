@@ -4,8 +4,15 @@ The live OpenAPI document at `/openapi.json` is the canonical source for
 request and response schemas. This guide explains stable route families,
 security expectations, asynchronous job behavior, and compatibility rules.
 
+For circuit history, team estimates and driver comparisons, see
+[Dashboard and Head-to-Head](dashboard-head-to-head.md).
+
 New clients should start with
 [weekend selection and Keycloak sign-in](weekend-selection-and-login.md).
+For driver/team browsing, bios, detail fields and 3D avatar integration, see
+[driver and team profiles](driver-team-profiles.md).
+For followed race weekend reminders and the in-app alert API, see
+[personalized alerts](personalized-alerts.md).
 `POST /weekends/select` replaces separate download actions in the normal
 client flow; `POST /auth/session` mirrors verified login identity into the DB.
 
@@ -175,6 +182,10 @@ updates are RacePulse-owned; credentials, enabled state, email verification,
 and roles remain Keycloak-owned. Admin user routes are under `/users/admin`.
 
 ## Fantasy V1 compatibility and V2 workflow
+
+For login-free development testing, see
+[Fantasy guest testing](fantasy-guest-testing.md). Production Fantasy fan
+routes still require Keycloak login.
 
 The V1 entry contract remains at:
 
