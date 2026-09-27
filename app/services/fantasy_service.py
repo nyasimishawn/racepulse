@@ -172,6 +172,7 @@ class FantasyService:
         statement = (
             select(RaceSession, Meeting)
             .join(Meeting, Meeting.id == RaceSession.meeting_id)
+            .where(Meeting.source != "FANTASY_REPLAY")
             .order_by(
                 Meeting.year.desc(),
                 RaceSession.started_at.desc(),
@@ -625,6 +626,8 @@ class FantasyService:
             )
 
         stats: dict[UUID, list[object]] = {}
+        if race_session_id is None:
+            statement = statement.where(Meeting.source != "FANTASY_REPLAY")
 
         for (
             profile_id,
@@ -1503,7 +1506,10 @@ class FantasyService:
         rows = self.db.execute(
             select(RaceSession, Meeting)
             .join(Meeting, Meeting.id == RaceSession.meeting_id)
-            .where(Meeting.year == selected_year)
+            .where(
+                Meeting.year == selected_year,
+                Meeting.source != "FANTASY_REPLAY",
+            )
             .order_by(RaceSession.started_at, RaceSession.name)
         ).all()
         entries: list[FantasyEntryProgressResponse] = []
@@ -1673,7 +1679,11 @@ class FantasyService:
         return FantasyRaceSummaryResponse(
             race_session_id=context.race.id,
             meeting_id=context.meeting.id,
-            meeting_name=context.meeting.name,
+            meeting_name=(
+                f"{context.meeting.name.rsplit(' Replay ', 1)[0]} · Replay"
+                if context.meeting.source == "FANTASY_REPLAY"
+                else context.meeting.name
+            ),
             year=context.meeting.year,
             session_name=context.race.name,
             started_at=context.race.started_at,
@@ -2808,6 +2818,8 @@ class FantasyService:
             statement = statement.where(
                 FantasyPrediction.race_session_id == race_session_id
             )
+        else:
+            statement = statement.where(Meeting.source != "FANTASY_REPLAY")
 
         stats: dict[UUID, list[object]] = {}
 

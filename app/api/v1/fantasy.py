@@ -75,6 +75,10 @@ from app.services.fantasy_service import (
     FantasyResolutionStateError,
     FantasyService,
 )
+from app.services.fantasy_replay_service import ReplayError
+from app.services.fantasy_replay_generic_service import (
+    GenericFantasyReplayService as FantasyReplayService,
+)
 from app.services.user_profile_service import UserProfileService
 from app.websocket.fantasy_streamer import FantasyStreamer
 
@@ -84,6 +88,97 @@ router = APIRouter(prefix="/fantasy", tags=["Fantasy"])
 
 class FantasyGuestSessionResponse(BaseModel):
     guest_key: str
+
+
+class FantasyReplayControlRequest(BaseModel):
+    playing: bool
+    speed: int
+
+
+class FantasyReplayStartRequest(BaseModel):
+    race_session_id: UUID
+
+
+def _replay_error(error: ReplayError) -> NoReturn:
+    message = str(error)
+    raise HTTPException(
+        status_code=(
+            status.HTTP_404_NOT_FOUND
+            if "not found" in message or "development only" in message
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        ),
+        detail=message,
+    ) from error
+
+
+def _fantasy_for_race(
+    db: Session, race_session_id: UUID, profile_id: UUID
+) -> FantasyService:
+    try:
+        clock = FantasyReplayService(db).clock_for_race(
+            race_session_id, profile_id
+        )
+    except ReplayError as error:
+        _replay_error(error)
+    return FantasyService(db, now=clock)
+
+
+@router.get("/replay", summary="Get my current development replay")
+def get_current_fantasy_replay(
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
+    db: Session = Depends(get_db),
+) -> dict | None:
+    try:
+        return FantasyReplayService(db).current(_profile_id(db, current_user))
+    except ReplayError as error:
+        _replay_error(error)
+
+
+@router.post("/replay", summary="Start an imported weekend replay")
+def start_fantasy_replay(
+    payload: FantasyReplayStartRequest | None = None,
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return FantasyReplayService(db).create(
+            _profile_id(db, current_user),
+            source_race_id=payload.race_session_id if payload else None,
+        )
+    except ReplayError as error:
+        _replay_error(error)
+
+
+@router.get("/replay/{race_session_id}", summary="Read replay clock and events")
+def get_fantasy_replay(
+    race_session_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return FantasyReplayService(db).state(
+            race_session_id, _profile_id(db, current_user)
+        )
+    except ReplayError as error:
+        _replay_error(error)
+
+
+@router.put("/replay/{race_session_id}", summary="Play or pause replay")
+def control_fantasy_replay(
+    race_session_id: UUID,
+    payload: FantasyReplayControlRequest,
+    current_user: AuthenticatedUser = Depends(get_fantasy_fan),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return FantasyReplayService(db).control(
+            race_session_id,
+            _profile_id(db, current_user),
+            playing=payload.playing,
+            speed=payload.speed,
+        )
+    except ReplayError as error:
+        _replay_error(error)
 
 
 @router.post(
@@ -142,7 +237,7 @@ def get_prediction(
 ) -> FantasyPredictionResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).get_prediction(
+        return _fantasy_for_race(db, race_session_id, profile_id).get_prediction(
             profile_id,
             race_session_id,
         )
@@ -162,7 +257,7 @@ def get_entry_progress(
 ) -> FantasyEntryProgressResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).get_entry_progress(
+        return _fantasy_for_race(db, race_session_id, profile_id).get_entry_progress(
             profile_id,
             race_session_id,
         )
@@ -183,7 +278,7 @@ def save_prediction(
 ) -> FantasyPredictionResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).save_prediction(
+        return _fantasy_for_race(db, race_session_id, profile_id).save_prediction(
             profile_id,
             race_session_id,
             payload,
@@ -206,7 +301,7 @@ def save_question(
 ) -> FantasyQuestionSaveResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).save_question(
+        return _fantasy_for_race(db, race_session_id, profile_id).save_question(
             user_profile_id=profile_id,
             race_session_id=race_session_id,
             question_key=question_key,
@@ -229,7 +324,9 @@ def get_community_percentages(
 ) -> FantasyCommunityResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).get_community_percentages(
+        return _fantasy_for_race(
+            db, race_session_id, profile_id
+        ).get_community_percentages(
             race_session_id=race_session_id,
             question_key=question_key,
             current_profile_id=profile_id,
@@ -411,7 +508,12 @@ def get_global_leaderboard(
 ) -> FantasyLeaderboardResponse:
     try:
         profile_id = _profile_id(db, current_user)
-        return FantasyService(db).get_global_leaderboard(
+        service = (
+            _fantasy_for_race(db, race_session_id, profile_id)
+            if race_session_id is not None
+            else FantasyService(db)
+        )
+        return service.get_global_leaderboard(
             current_profile_id=profile_id,
             year=year,
             race_session_id=race_session_id,
