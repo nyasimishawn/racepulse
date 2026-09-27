@@ -24,6 +24,8 @@ licensing review.
 
 See the [race calendar and Paddock guide](docs/race-calendar.md),
 [API guide](docs/api-guide.md),
+[personalized alerts](docs/personalized-alerts.md),
+[Fantasy guest testing](docs/fantasy-guest-testing.md),
 [architecture](docs/architecture.md),
 [data-source rules](docs/data-sources.md), and
 [Keycloak operational checklist](docs/keycloak-user-backend-setup.md).

@@ -55,3 +55,6 @@ jobs:
           tests/services/test_calendar_sync_service.py
           tests/services/test_durable_job_service.py
           tests/services/test_weekend_download_service.py
+          tests/api/test_alerts_api.py
+          tests/api/test_fantasy_guest_api.py
+          tests/services/test_alert_service.py

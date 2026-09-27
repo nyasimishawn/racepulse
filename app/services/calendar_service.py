@@ -110,6 +110,8 @@ class CalendarService:
             if duplicate and duplicate.id != weekend_id:
                 raise ValueError("Meeting is already linked to a weekend.")
         now = datetime.now(UTC)
+        previous = row.schedule if row is not None else None
+        previous_meeting_id = row.meeting_id if row is not None else None
         if row is None:
             row = CalendarWeekend()
             self.db.add(row)
@@ -131,6 +133,13 @@ class CalendarService:
                 changed_at=now,
             )
         )
+        self.db.flush()
+        if previous is not None:
+            from app.services.alert_service import AlertService, meaningful_schedule
+
+            if (meaningful_schedule(previous) != meaningful_schedule(row.schedule)
+                    or previous_meeting_id != row.meeting_id):
+                AlertService(self.db, now=now).calendar_changed(row, previous)
         self.db.commit()
         return self.overview(row)
 

@@ -26,6 +26,7 @@ from app.services.durable_job_target_service import (
     synchronize_cancelled_import_targets,
 )
 from app.services.fantasy_service import FantasyService
+from app.services.alert_service import AlertService, NoopPushDelivery, PushDelivery
 from app.services.lap_service import LapImportService
 from app.services.race_context_service import RaceContextService
 from app.services.session_import_service import SessionImportService
@@ -48,10 +49,12 @@ class DurableJobWorker:
         redis: Redis,
         *,
         worker_id: str | None = None,
+        push_delivery: PushDelivery | None = None,
     ) -> None:
         self.redis = redis
         self.publisher = RedisStreamJobPublisher(redis)
         self.worker_id = worker_id or (f"{socket.gethostname()}-{uuid4()}")
+        self.push_delivery = push_delivery or NoopPushDelivery()
         self._last_recovery_at: datetime | None = None
 
     def run_forever(self) -> None:
@@ -124,6 +127,9 @@ class DurableJobWorker:
             service = DurableJobService(db, publisher=self.publisher)
             service.recover_expired_leases()
             synchronize_cancelled_import_targets(db)
+            alerts = AlertService(db, now=now, push=self.push_delivery)
+            alerts.refresh_missing_fantasy_reminders()
+            alerts.deliver_due()
             service.dispatch_ready(
                 minimum_age_seconds=settings.job_recovery_interval_seconds
             )

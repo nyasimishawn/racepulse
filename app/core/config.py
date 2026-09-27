@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     keycloak_send_verification_email: bool = False
     keycloak_default_role: str = "fan"
     keycloak_assignable_roles: str = "fan,editor,admin"
+    fantasy_guest_mode: bool = True
 
     # Request handling and abuse protection. These are intentionally modest
     # defaults for local development; production operators should set them
@@ -67,6 +68,10 @@ class Settings(BaseSettings):
             and bool(self.keycloak_issuer_url)
             and bool(self.keycloak_audience)
         )
+
+    @property
+    def fantasy_guest_access_enabled(self) -> bool:
+        return self.environment == "development" and self.fantasy_guest_mode
 
     @property
     def keycloak_swagger_configured(self) -> bool:
