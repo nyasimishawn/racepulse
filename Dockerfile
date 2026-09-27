@@ -22,6 +22,8 @@ RUN python -m pip install --upgrade pip \
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
+COPY scripts/seed_fantasy_simulation.py ./scripts/seed_fantasy_simulation.py
+COPY scripts/simulate_fantasy.py ./scripts/simulate_fantasy.py
 COPY run.py ./
 
 RUN mkdir -p /var/lib/racepulse/fastf1-cache \
