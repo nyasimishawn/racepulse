@@ -49,6 +49,16 @@ class TeamWinEstimate(BaseModel):
     driver_affinity_share: float
 
 
+class TrackMeasuredFacts(BaseModel):
+    """Measurements from imported data, not official circuit records."""
+
+    lap_distance_km: float | None = None
+    lap_distance_sample_laps: int = 0
+    lap_distance_year: int | None = None
+    highest_speed_trap_kph: float | None = None
+    highest_speed_trap_year: int | None = None
+
+
 class TrackDashboardResponse(BaseModel):
     track: DashboardTrack
     season_year: int
@@ -57,6 +67,7 @@ class TrackDashboardResponse(BaseModel):
     team_estimates: list[TeamWinEstimate]
     track_race_count: int
     track_qualifying_count: int
+    measured_facts: TrackMeasuredFacts
     season_race_count: int
     latest_season_race_at: datetime | None
     forecast_available: bool

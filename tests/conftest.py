@@ -17,6 +17,12 @@ from app.db.database import get_db
 from app.main import app
 
 
+@pytest.fixture(autouse=True)
+def disable_live_calendar_network(monkeypatch):
+    # Isolated test data never triggers the developer's live sync collector.
+    monkeypatch.setattr(settings, "calendar_sync_enabled", False)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--postgresql",

@@ -6,3 +6,7 @@ addopts = "-ra"
 [tool.ruff]
 target-version = "py313"
 line-length = 79
+
+[tool.ruff.lint]
+# Keep the established rule set consistent across Ruff upgrades.
+select = ["E4", "E7", "E9", "F"]

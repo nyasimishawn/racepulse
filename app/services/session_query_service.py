@@ -48,6 +48,7 @@ class SessionQueryService:
         return [
             self._to_session_summary(race_session, meeting)
             for race_session, meeting in rows
+            if not (race_session.source_metadata or {}).get("calendar_only")
         ]
 
     def meeting_exists(self, meeting_id: UUID) -> bool:
@@ -165,6 +166,7 @@ class SessionQueryService:
         meeting: Meeting,
     ) -> SessionSummaryResponse:
         return SessionSummaryResponse(
+            imported=not (race_session.source_metadata or {}).get("calendar_only"),
             id=race_session.id,
             meeting_id=meeting.id,
             source=meeting.source,

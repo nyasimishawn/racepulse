@@ -9,7 +9,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
-from app.services.calendar_service import calendar_identifier, fantasy_schedule
+from app.models.calendar import CalendarWeekend
+from app.services.calendar_service import (
+    CalendarService, calendar_identifier, fantasy_schedule,
+)
 from app.models.fantasy import (
     FantasyEntryStatus,
     FantasyGroup,
@@ -185,7 +188,7 @@ class FantasyService:
 
         rows = self.db.execute(statement).all()
 
-        return [
+        races = [
             self._race_summary(
                 FantasyRaceContext(
                     race=race,
@@ -196,6 +199,9 @@ class FantasyService:
             for race, meeting in rows
             if self._is_race_session(race)
         ]
+        # Current is authoritative even when test/import rows have newer dates.
+        races.sort(key=lambda race: not race.is_current)
+        return races
 
     def get_prediction(
         self,
@@ -420,6 +426,19 @@ class FantasyService:
                 derived = self._automatic_resolution(context, question)
 
                 if derived is not None:
+                    target = self.db.get(RaceSession, question.target_session_id)
+                    evidence = (target.source_metadata or {}).get(
+                        "official_results", {}
+                    ) if target else {}
+                    if evidence.get("source_url"):
+                        flags = [*derived.data_quality_flags,
+                                 "OFFICIAL_F1_CLASSIFICATION"]
+                        if "Provisional" in evidence.get("versions", []):
+                            flags.append("PROVISIONAL_RESULT")
+                        derived = replace(
+                            derived, source_reference=evidence["source_url"],
+                            data_quality_flags=flags,
+                        )
                     resolution = self._upsert_resolution(
                         context=context,
                         question=question,
@@ -1302,6 +1321,39 @@ class FantasyService:
                     )
                 )
 
+        sprint_qualifying = next((
+            session for session in context.sessions
+            if calendar_identifier(session.session_identifier) == "SQ"
+        ), None)
+        if sprint_qualifying is not None:
+            for segment in ("SQ1", "SQ2", "SQ3"):
+                questions.append(FantasyQuestionDefinition(
+                    key=f"{segment}_FASTEST",
+                    label=f"{segment} fastest driver",
+                    category="QUALIFYING", answer_kind="DRIVER",
+                    target_session_id=sprint_qualifying.id,
+                    target_session_name=sprint_qualifying.name,
+                    locks_at=sprint_qualifying.started_at, max_points=3,
+                    qualifying_column=f"q{segment[-1]}_time_ms",
+                ))
+
+        sprint = next((
+            session for session in context.sessions
+            if calendar_identifier(session.session_identifier) == "S"
+        ), None)
+        if sprint is not None:
+            for position, label in (
+                (1, "Sprint winner"), (2, "Sprint second place"),
+                (3, "Sprint third place"),
+            ):
+                questions.append(FantasyQuestionDefinition(
+                    key=f"SPRINT_P{position}", label=label,
+                    category="RACE", answer_kind="DRIVER",
+                    target_session_id=sprint.id, target_session_name=sprint.name,
+                    locks_at=sprint.started_at, max_points=5,
+                    race_position=position,
+                ))
+
         race = context.race
         race_questions = [
             (
@@ -1676,17 +1728,34 @@ class FantasyService:
         self,
         context: FantasyRaceContext,
     ) -> FantasyRaceSummaryResponse:
+        weekend = self.db.scalar(select(CalendarWeekend).where(
+            CalendarWeekend.meeting_id == context.meeting.id
+        ))
+        if not hasattr(self, "_current_calendar"):
+            self._current_calendar = CalendarService(
+                self.db, now=self._now()
+            ).next()
+        current = self._current_calendar
         return FantasyRaceSummaryResponse(
             race_session_id=context.race.id,
             meeting_id=context.meeting.id,
             meeting_name=(
                 f"{context.meeting.name.rsplit(' Replay ', 1)[0]} · Replay"
                 if context.meeting.source == "FANTASY_REPLAY"
-                else context.meeting.name
+                else weekend.event_name if weekend else context.meeting.name
             ),
             year=context.meeting.year,
             session_name=context.race.name,
             started_at=context.race.started_at,
+            is_current=(
+                context.meeting.source in {"FASTF1", "OPENF1"}
+                and weekend is not None and current is not None
+                and current["id"] == weekend.id
+            ),
+            is_replay=context.meeting.source == "FANTASY_REPLAY",
+            source=context.meeting.source,
+            calendar_weekend_id=weekend.id if weekend else None,
+            round_number=weekend.schedule["round_number"] if weekend else None,
         )
 
     def _candidate_options(
@@ -1705,6 +1774,16 @@ class FantasyService:
                 SessionResult.team_id,
             ).where(SessionResult.race_session_id.in_(session_ids))
         ).all()
+
+        # Upcoming weekends reuse only a verified current-season entry list.
+        # Never fall back to every historical FASTF1 driver/team in the database.
+        calendar = (context.race.source_metadata or {}).get("calendar", {})
+        roster = (context.race.source_metadata or {}).get("fantasy_roster", [])
+        if calendar and roster:
+            participant_rows = [
+                (UUID(row["driver_id"]), UUID(row["team_id"]))
+                for row in roster if row.get("driver_id") and row.get("team_id")
+            ]
 
         driver_ids = {
             driver_id for driver_id, _ in participant_rows
@@ -1726,6 +1805,8 @@ class FantasyService:
             driver_statement = driver_statement.where(
                 Driver.id.in_(driver_ids)
             )
+        elif calendar:
+            driver_statement = driver_statement.where(Driver.id.in_([]))
         else:
             driver_statement = driver_statement.where(
                 Driver.source == context.meeting.source
@@ -1737,6 +1818,8 @@ class FantasyService:
             team_statement = team_statement.where(
                 Team.id.in_(team_ids)
             )
+        elif calendar:
+            team_statement = team_statement.where(Team.id.in_([]))
         else:
             team_statement = team_statement.where(
                 Team.source == context.meeting.source
@@ -1848,17 +1931,18 @@ class FantasyService:
         self,
         picks_by_key: dict[str, FantasyPredictionPick],
     ) -> None:
-        selected_drivers = [
-            picks_by_key[key].driver_id
-            for key in self._PODIUM_KEYS
-            if key in picks_by_key
-            and picks_by_key[key].driver_id is not None
-        ]
-
-        if len(selected_drivers) != len(set(selected_drivers)):
-            raise FantasyInvalidRequestError(
-                "The P1, P2, and P3 picks must be different drivers."
-            )
+        for keys in (
+            self._PODIUM_KEYS, ("SPRINT_P1", "SPRINT_P2", "SPRINT_P3"),
+        ):
+            selected_drivers = [
+                picks_by_key[key].driver_id for key in keys
+                if key in picks_by_key
+                and picks_by_key[key].driver_id is not None
+            ]
+            if len(selected_drivers) != len(set(selected_drivers)):
+                raise FantasyInvalidRequestError(
+                    "The P1, P2, and P3 picks must be different drivers."
+                )
 
     def _automatic_resolution(
         self,
@@ -1921,7 +2005,7 @@ class FantasyService:
             result = self.db.scalar(
                 select(SessionResult)
                 .where(
-                    SessionResult.race_session_id == context.race.id,
+                    SessionResult.race_session_id == question.target_session_id,
                     SessionResult.position == question.race_position,
                 )
                 .order_by(SessionResult.driver_id)
@@ -1935,7 +2019,7 @@ class FantasyService:
                 team_id=None,
                 driver_ids=[],
                 source_reference=(
-                    f"session_results:{context.race.id}"
+                    f"session_results:{question.target_session_id}"
                 ),
                 data_quality_flags=["PUBLIC_RACE_CLASSIFICATION"],
             )

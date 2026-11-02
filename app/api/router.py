@@ -15,7 +15,9 @@ from app.api.v1 import (
     jobs,
     lap_comparison,
     laps,
+    live,
     meetings,
+    news,
     provider_preview,
     profiles,
     push_manage_timeline,
@@ -29,6 +31,7 @@ from app.api.v1 import (
     sessions,
     strategy,
     telemetry,
+    trivia,
     users,
     weekends,
 )
@@ -39,6 +42,7 @@ api_router.include_router(dashboard.router)
 
 api_router.include_router(health.router)
 api_router.include_router(calendar.router)
+api_router.include_router(live.router)
 api_router.include_router(weekends.router)
 api_router.include_router(jobs.router)
 api_router.include_router(import_jobs.router)
@@ -64,11 +68,13 @@ api_router.include_router(race_engineering.router)
 api_router.include_router(replay.router)
 api_router.include_router(replay_rooms.router)
 api_router.include_router(editorial.router)
+api_router.include_router(news.router)
 
 api_router.include_router(session_map_imports.session_router)
 api_router.include_router(session_map_imports.job_router)
 
 api_router.include_router(fantasy.router)
+api_router.include_router(trivia.router)
 
 api_router.include_router(session_telemetry_imports.session_router)
 api_router.include_router(session_telemetry_imports.job_router)

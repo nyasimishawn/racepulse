@@ -3,10 +3,12 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app.models.driver import Driver
+from app.models.lap import Lap
 from app.models.meeting import Meeting
 from app.models.race_session import RaceSession
 from app.models.session_result import SessionResult
 from app.models.team import Team
+from app.models.telemetry_point import TelemetryPoint
 
 
 def seed_dashboard(db):
@@ -151,3 +153,60 @@ def test_missing_points_disable_forecast_and_are_not_claimed_complete(
         t["estimated_win_percent"] is None for t in data["team_estimates"]
     )
     assert "TRACK_POINTS_PARTIAL" in data["data_quality_flags"]
+
+
+def test_measured_circuit_facts_use_only_imported_matching_past_laps(
+    api_client, db_session
+):
+    meetings, drivers, _ = seed_dashboard(db_session)
+
+    def add_laps(meeting, speed, distance):
+        session = (
+            db_session.query(RaceSession)
+            .filter(
+                RaceSession.meeting_id == meeting.id,
+                RaceSession.session_identifier == "R",
+            )
+            .one()
+        )
+        for number in range(1, 4):
+            lap = Lap(
+                race_session_id=session.id,
+                driver_id=drivers[0].id,
+                lap_number=number,
+                lap_time_ms=90_000,
+                is_accurate=True,
+                speed_st=Decimal(speed + number),
+            )
+            db_session.add(lap)
+            db_session.flush()
+            db_session.add_all(
+                TelemetryPoint(
+                    race_session_id=session.id,
+                    driver_id=drivers[0].id,
+                    lap_id=lap.id,
+                    sample_index=i,
+                    relative_time_ms=i * 100,
+                    distance_m=Decimal(distance * i / 24),
+                )
+                for i in range(25)
+            )
+
+    add_laps(meetings[4], 330, 6000)  # Harbor, 2026
+    add_laps(meetings[2], 400, 5500)  # Different circuit
+    add_laps(meetings[5], 420, 6100)  # Future season
+    db_session.commit()
+
+    path = f"/api/v1/dashboard/tracks/{meetings[0].id}?season_year=2026"
+    facts = api_client.get(path).json()["measured_facts"]
+    assert facts == {
+        "lap_distance_km": 6.0,
+        "lap_distance_sample_laps": 3,
+        "lap_distance_year": 2026,
+        "highest_speed_trap_kph": 333.0,
+        "highest_speed_trap_year": 2026,
+    }
+
+    before = api_client.get(path + "&as_of=2026-04-01T00:00:00Z").json()
+    assert before["measured_facts"]["lap_distance_km"] is None
+    assert before["measured_facts"]["highest_speed_trap_kph"] is None

@@ -79,8 +79,9 @@ def fantasy_schedule(db: Session, meeting_id: UUID) -> dict:
 
 
 class CalendarService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, now: datetime | None = None):
         self.db = db
+        self._now = utc(now) if now else None
 
     def save(
         self,
@@ -164,7 +165,9 @@ class CalendarService:
                 {
                     **item,
                     "race_session_id": linked.id if linked else None,
-                    "imported": linked is not None,
+                    "imported": linked is not None and not (
+                        linked.source_metadata or {}
+                    ).get("calendar_only", False),
                 }
             )
         return {
@@ -188,7 +191,7 @@ class CalendarService:
         ]
 
     def next(self):
-        now = datetime.now(UTC)
+        now = self._now or datetime.now(UTC)
         candidates = []
         for row in self.db.scalars(select(CalendarWeekend)).all():
             if row.schedule["status"] not in {"SCHEDULED", "IN_PROGRESS"}:
@@ -204,7 +207,7 @@ class CalendarService:
             start = datetime.fromisoformat(
                 race["starts_at"].replace("Z", "+00:00")
             )
-            if start >= now or "IN_PROGRESS" in {
+            if start.date() >= now.date() or "IN_PROGRESS" in {
                 race["status"],
                 row.schedule["status"],
             }:

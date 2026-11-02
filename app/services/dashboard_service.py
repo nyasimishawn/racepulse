@@ -1,21 +1,24 @@
 from collections import defaultdict
 from datetime import UTC, datetime
-from statistics import mean
+from statistics import mean, median
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
+from app.models.lap import Lap
 from app.models.meeting import Meeting
 from app.models.race_session import RaceSession
 from app.models.session_result import SessionResult
 from app.models.team import Team
+from app.models.telemetry_point import TelemetryPoint
 from app.schemas.dashboard import (
     DashboardTrack,
     TeamWinEstimate,
     TrackDashboardResponse,
     TrackDriverStats,
+    TrackMeasuredFacts,
 )
 
 
@@ -221,6 +224,7 @@ class DashboardService:
             team_estimates=estimates,
             track_race_count=len(race_ids),
             track_qualifying_count=len(qualifying_ids),
+            measured_facts=self._measured_facts(track_ids, cutoff),
             season_race_count=len({row[1].id for row in season}),
             latest_season_race_at=latest,
             forecast_available=available,
@@ -244,6 +248,98 @@ class DashboardService:
                 "from pole; qualifying poles are counted separately. Forecasts use "
                 "the latest imported lineup, not a verified current entry list."
             ),
+        )
+
+    def _measured_facts(
+        self, track_ids: set[UUID], cutoff: datetime
+    ) -> TrackMeasuredFacts:
+        """Use only dated imported laps; avoid claiming official records."""
+        lap_date = func.coalesce(
+            Lap.lap_start_at, RaceSession.started_at, Meeting.event_date
+        )
+        base_filters = (
+            Meeting.id.in_(track_ids),
+            RaceSession.session_identifier.in_(("R", "Q")),
+            lap_date < cutoff,
+            Lap.deleted.is_not(True),
+        )
+        speed = self.db.execute(
+            select(Lap.speed_st, Meeting.year)
+            .join(RaceSession, Lap.race_session_id == RaceSession.id)
+            .join(Meeting, RaceSession.meeting_id == Meeting.id)
+            .where(*base_filters, Lap.speed_st.between(100, 450))
+            .order_by(Lap.speed_st.desc(), Lap.id)
+            .limit(1)
+        ).first()
+
+        laps = self.db.execute(
+            select(Lap.id, Meeting.id, Meeting.year)
+            .join(RaceSession, Lap.race_session_id == RaceSession.id)
+            .join(Meeting, RaceSession.meeting_id == Meeting.id)
+            .where(
+                *base_filters,
+                Lap.lap_time_ms.is_not(None),
+                Lap.is_accurate.is_not(False),
+                select(TelemetryPoint.id)
+                .where(
+                    TelemetryPoint.lap_id == Lap.id,
+                    TelemetryPoint.distance_m.is_not(None),
+                )
+                .exists(),
+            )
+            .order_by(lap_date.desc(), Lap.lap_number, Lap.id)
+            .limit(30)
+        ).all()
+        distance = None
+        sample_count = 0
+        distance_year = None
+        if laps:
+            # Keep one meeting's layout together. A location can change over
+            # the years even when its provider key stays the same.
+            latest_meeting = laps[0][1]
+            chosen = [row for row in laps if row[1] == latest_meeting]
+            distances = self.db.execute(
+                select(
+                    TelemetryPoint.lap_id,
+                    func.min(TelemetryPoint.distance_m),
+                    func.max(TelemetryPoint.distance_m),
+                    func.count(TelemetryPoint.id),
+                )
+                .where(
+                    TelemetryPoint.lap_id.in_([row[0] for row in chosen]),
+                    TelemetryPoint.distance_m.is_not(None),
+                    TelemetryPoint.is_interpolated.is_(False),
+                )
+                .group_by(TelemetryPoint.lap_id)
+            ).all()
+            lengths = [
+                float(last) / 1000
+                for _, first, last, count in distances
+                if count >= 20
+                and first is not None
+                and last is not None
+                and float(first) <= 100
+                and 1.5 <= float(last) / 1000 <= 9
+            ]
+            if len(lengths) >= 3:
+                center = median(lengths)
+                consistent = [
+                    length
+                    for length in lengths
+                    if abs(length - center) <= center * 0.03
+                ]
+                if len(consistent) >= 3:
+                    distance = round(median(consistent), 3)
+                    sample_count = len(consistent)
+                    distance_year = chosen[0][2]
+        return TrackMeasuredFacts(
+            lap_distance_km=distance,
+            lap_distance_sample_laps=sample_count,
+            lap_distance_year=distance_year,
+            highest_speed_trap_kph=(
+                round(float(speed[0]), 1) if speed else None
+            ),
+            highest_speed_trap_year=speed[1] if speed else None,
         )
 
     @staticmethod

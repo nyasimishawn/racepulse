@@ -46,9 +46,13 @@ CANCELLED, IN_PROGRESS and COMPLETED. Postponed/cancelled sessions can omit time
 For manual entries the source URL records the editor's evidence. The automated
 worker fetches structured schedules directly from Formula 1 race pages.
 
-After importing a meeting, update the calendar with its `meeting_id`. The link
-is explicit to avoid guessing between similarly named events. Session links are
-then resolved by identifier on reads, including sessions imported later.
+Official synchronization links an existing matching FastF1 meeting or creates
+the meeting and its scheduled sessions before telemetry is downloaded. Existing
+links and unambiguous season/name or dated venue matches retain their IDs.
+Metadata-only sessions have `source_metadata.calendar_only=true` and report
+`imported=false`; they contain no fabricated classifications or telemetry.
+Manual calendar entries can still be linked explicitly with `meeting_id`.
+Session links are resolved by identifier, including sessions imported later.
 The provider identifier SS (Sprint Shootout) maps to calendar identifier SQ. Once
 assigned, the meeting link cannot be replaced by this API. Historical imported
 timestamps are preserved. Linked Fantasy questions use calendar times instead.
@@ -68,7 +72,7 @@ or reverse already awarded points; scoring resolution remains an editor action.
 3. Publish the reviewed starter stories:
    `.venv\Scripts\python.exe -m app.cli.seed_paddock`.
 4. Run `.venv\Scripts\python.exe -m app.workers.calendar_sync_worker` for a
-   refresh every six hours. `--year` selects a season; `--interval` adjusts the
+   refresh every fifteen minutes. `--year` selects a season; `--interval` adjusts the
    interval (minimum five minutes). Docker Compose includes `calendar-sync`
    with a restart policy. Apply migrations before starting the services.
 
@@ -77,6 +81,35 @@ restart itself after Windows reboots. `GET /calendar/sync-status?year=2026`
 reports the last check, counts and any failed/missing source pages. Read this
 status when checking operational health; an unchanged calendar is not proof
 that a recent fetch succeeded.
+
+The API also starts a supervised calendar/Fantasy refresh when enabled by
+`CALENDAR_SYNC_ENABLED` (enabled by default). `CALENDAR_SYNC_INTERVAL_SECONDS`
+sets its interval. A PostgreSQL advisory lock covers the full calendar and
+Fantasy refresh, so an API refresh and a standalone worker cannot overlap.
+
+## Live Fantasy weekends
+
+`GET /fantasy/races` includes `is_current`, `is_replay`, `source`,
+`calendar_weekend_id` and `round_number`. Only a real provider meeting linked
+to the calendar's current weekend can have `is_current=true`; test/simulation
+and replay meetings never become the automatic selection. `/weekends/next`
+retains the race on race day until the source confirms completion, without
+claiming that an elapsed start time proves the race is live.
+
+The worker refreshes published results for the current and most recent
+completed weekends. Only an authoritative `COMPLETED` session is eligible;
+in-progress tables and empty entry lists do not settle predictions. Results
+come from the event's own Formula 1 results links. The latest observed season
+participants supply the current/future Fantasy options, including team
+changes and new entrants. Until a verified roster is available, options are
+empty instead of mixing every driver from older seasons.
+
+Sprint weekends include SQ1/SQ2/SQ3 fastest-driver picks and a sprint podium,
+with their own session deadlines. Official provisional classifications remain
+flagged `PROVISIONAL_RESULT`, include their source URL, and are recalculated on
+later refreshes. Missing lap/speed-trap evidence stays pending, and retirements
+retain the existing editor verification policy. Refreshes do not automatically
+finalize weekends. Manual replays and simulation data remain available.
 
 Sync uses stable source URLs, explicit UTC dates and source statuses. It updates
 changed entries with an audit revision, leaves unchanged entries alone, and
