@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.driver import Driver
+from app.models.calendar import CalendarWeekend
 from app.models.import_job import DataSource, ImportJob, ImportJobStatus
 from app.models.meeting import Meeting
 from app.models.race_session import RaceSession
@@ -19,6 +20,7 @@ from app.services.durable_job_service import (
     JobStateError,
 )
 from app.services.error_message import safe_provider_error_message
+from app.services.official_f1_data import normalized_name
 
 
 class ImportJobNotFoundError(LookupError):
@@ -186,6 +188,19 @@ class SessionImportService:
         )
 
         if meeting is None:
+            # Calendar stubs own the stable IDs used by live Fantasy picks.
+            round_number = self._integer(event.get("RoundNumber"))
+            weekend = next((weekend for weekend in self.db.scalars(
+                select(CalendarWeekend).where(
+                    CalendarWeekend.year == job.year,
+                    CalendarWeekend.meeting_id.is_not(None),
+                )
+            ).all() if weekend.schedule["round_number"] == round_number), None)
+            linked = self.db.get(Meeting, weekend.meeting_id) if weekend else None
+            if linked is not None and linked.source == source:
+                meeting = linked
+
+        if meeting is None:
             meeting = Meeting(
                 source=source,
                 year=job.year,
@@ -240,6 +255,9 @@ class SessionImportService:
         race_session.session_identifier = session_identifier
         race_session.session_type = session_type
         race_session.started_at = self._datetime(fastf1_session.date)
+        race_session.source_metadata = {
+            **(race_session.source_metadata or {}), "calendar_only": False,
+        }
 
         return race_session
 
@@ -261,6 +279,14 @@ class SessionImportService:
                 Team.source_identifier == source_identifier,
             )
         )
+
+        if team is None:
+            team = next((candidate for candidate in self.db.scalars(
+                select(Team).where(Team.source == source)
+            ).all() if candidate.source_identifier
+                and candidate.source_identifier.startswith("f1:")
+                and normalized_name(candidate.name)
+                == normalized_name(team_name)), None)
 
         if team is None:
             team = Team(
@@ -294,6 +320,22 @@ class SessionImportService:
                 Driver.source_identifier == source_identifier,
             )
         )
+
+        if driver is None:
+            full_name = self._text(result_row.get("FullName")) or " ".join(
+                self._text(result_row.get(key)) or ""
+                for key in ("FirstName", "LastName")
+            )
+            abbreviation = self._text(result_row.get("Abbreviation"))
+            driver = next((candidate for candidate in self.db.scalars(
+                select(Driver).where(Driver.source == source)
+            ).all() if candidate.source_identifier
+                and candidate.source_identifier.startswith("f1:")
+                and (normalized_name(candidate.full_name or "")
+                     == normalized_name(full_name)
+                     or (candidate.driver_number == driver_number
+                         and abbreviation
+                         and candidate.abbreviation == abbreviation))), None)
 
         if driver is None:
             driver = Driver(

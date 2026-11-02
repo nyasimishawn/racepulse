@@ -1,5 +1,9 @@
 from app.models.alert import Alert, WeekendAlertPreference
-from app.models.calendar import CalendarRevision, CalendarSyncState, CalendarWeekend
+from app.models.calendar import (
+    CalendarRevision,
+    CalendarSyncState,
+    CalendarWeekend,
+)
 from app.models.curated_content import (
     DriverProfile,
     EditorialUpdate,
@@ -22,6 +26,7 @@ from app.models.fantasy import (
 from app.models.import_job import ImportJob
 from app.models.lap import Lap
 from app.models.meeting import Meeting
+from app.models.news import ImportedNews, NewsSourceState, NewsWorkerLease
 from app.models.race_control_event import RaceControlEvent
 from app.models.race_session import RaceSession
 from app.models.session_map_import import SessionMapImport
@@ -59,6 +64,9 @@ __all__ = [
     "ImportJob",
     "Lap",
     "Meeting",
+    "ImportedNews",
+    "NewsSourceState",
+    "NewsWorkerLease",
     "ProfileNotableMoment",
     "RaceControlEvent",
     "RaceSession",
@@ -70,7 +78,17 @@ __all__ = [
     "Team",
     "TeamProfile",
     "TelemetryPoint",
+    "TriviaAnswer",
+    "TriviaGuest",
+    "TriviaQuestion",
+    "TriviaRace",
     "UserProfile",
     "WeatherSample",
     "WeekendDownload",
 ]
+from app.models.trivia import (
+    TriviaAnswer,
+    TriviaGuest,
+    TriviaQuestion,
+    TriviaRace,
+)

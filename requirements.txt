@@ -17,6 +17,7 @@ numpy
 # Cache and real-time replay
 redis
 websockets
+aiomqtt>=2.4,<3
 
 # Reliability and structured logs
 tenacity
@@ -28,6 +29,7 @@ python-dotenv
 pytest
 pytest-asyncio
 pytest-cov
+fakeredis[lua]>=2.31,<3
 ruff
 
 uvicorn

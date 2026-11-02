@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 
 class SessionSummaryResponse(BaseModel):
+    imported: bool = True
     id: UUID
     meeting_id: UUID
     source: str

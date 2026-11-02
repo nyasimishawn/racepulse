@@ -6,11 +6,14 @@ import re
 import ssl
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from app.models.calendar import CalendarSyncState, CalendarWeekend
+from app.models.meeting import Meeting
+from app.models.race_session import RaceSession
 from app.schemas.calendar import CalendarWeekendInput
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import CalendarService, calendar_identifier, utc
+from app.services.official_f1_data import flight_records, normalized_name, objects
 
 BASE = "https://www.formula1.com"
 IDENTIFIERS = {
@@ -58,6 +61,13 @@ def parse_event(html: str, url: str, year: int, now: datetime):
             s["description"]: s.get("state")
             for s in json.loads(state_match[1])
         }
+    for item in objects(flight_records(html)):
+        if isinstance(item.get("meetingSessions"), list):
+            states.update({
+                session["description"]: session.get("state")
+                for session in item["meetingSessions"]
+                if isinstance(session, dict) and "description" in session
+            })
     sessions = []
     name = None
     for item in event["subEvent"]:
@@ -113,6 +123,107 @@ def fetch_page(client, url):
             if len(data) > 5_000_000:
                 raise ValueError("Official page exceeds supported size.")
     return data.decode("utf-8")
+
+
+def ensure_calendar_sessions(db, payload, html, row=None):
+    """Create schedule metadata without inventing classifications/telemetry."""
+    meeting = db.get(Meeting, row.meeting_id) if row and row.meeting_id else None
+    metadata = next((
+        item for item in objects(flight_records(html))
+        if item.get("meetingName") == payload.event_name
+        and item.get("meetingCountryName")
+    ), {})
+    race = next(s for s in payload.sessions if s.identifier == "R")
+    if meeting is None:
+        meeting = db.scalar(select(Meeting).where(
+            Meeting.source == "FASTF1", Meeting.year == payload.year,
+            Meeting.name == payload.event_name,
+        ))
+    if meeting is None:
+        # Reuse an unambiguous provider alias/venue before making a new stub.
+        # Same-circuit double headers need distinct dates to qualify.
+        aliases = {normalized_name(payload.event_name)}
+        if metadata.get("meetingOfficialName"):
+            aliases.add(normalized_name(metadata["meetingOfficialName"]))
+        candidates = []
+        for candidate in db.scalars(select(Meeting).where(
+            Meeting.source == "FASTF1", Meeting.year == payload.year,
+        )).all():
+            name_match = bool(aliases & {
+                normalized_name(candidate.name),
+                normalized_name(candidate.official_name or ""),
+            })
+            venue_match = (
+                metadata.get("meetingLocation") and candidate.location
+                and normalized_name(candidate.location)
+                == normalized_name(metadata["meetingLocation"])
+                and normalized_name(candidate.country_name or "")
+                == normalized_name(metadata.get("meetingCountryName", ""))
+                and (not candidate.event_date or not race.starts_at
+                     or utc(candidate.event_date).date()
+                     == utc(race.starts_at).date())
+            )
+            if name_match or venue_match:
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            meeting = candidates[0]
+    if meeting is None:
+        meeting = Meeting(
+            source="FASTF1", year=payload.year, name=payload.event_name,
+        )
+        db.add(meeting)
+        db.flush()
+    payload.meeting_id = meeting.id
+    for field, key in (
+        ("official_name", "meetingOfficialName"),
+        ("country_name", "meetingCountryName"),
+        ("location", "meetingLocation"),
+    ):
+        if metadata.get(key):
+            setattr(meeting, field, metadata[key])
+    meeting.event_date = race.starts_at
+    imported = db.scalars(select(RaceSession).where(
+        RaceSession.meeting_id == meeting.id
+    )).all()
+    by_identifier = {
+        calendar_identifier(s.session_identifier): s for s in imported
+    }
+    suffixes = {
+        "FP1": "practice/1", "FP2": "practice/2", "FP3": "practice/3",
+        "SQ": "sprint-qualifying", "S": "sprint-results",
+        "Q": "qualifying", "R": "race-result",
+    }
+    # Derive the results prefix from the official page's published links.
+    slug = str(payload.source_url).rstrip("/").rsplit("/", 1)[-1]
+    key_pattern = re.escape(str(metadata["meetingKey"])) \
+        if metadata.get("meetingKey") else r"\d+"
+    paths = re.findall(
+        rf'/en/results/{payload.year}/races/{key_pattern}/{re.escape(slug)}/', html
+    )
+    prefix = BASE + paths[0] if paths else None
+    for item in payload.sessions:
+        session = by_identifier.get(item.identifier)
+        if session is None:
+            session = RaceSession(
+                meeting_id=meeting.id, name=item.name,
+                session_identifier=item.identifier, session_type=item.name,
+                started_at=item.starts_at,
+                source_metadata={"calendar_only": True},
+            )
+            db.add(session)
+        elif (session.source_metadata or {}).get("calendar_only"):
+            session.started_at = item.starts_at
+        session.source_metadata = {
+            **(session.source_metadata or {}),
+            "calendar": {
+                "source_url": str(payload.source_url),
+                "round_number": payload.round_number,
+                "status": item.status,
+                "results_url": prefix + suffixes[item.identifier]
+                if prefix else None,
+            },
+        }
+    db.flush()
 
 
 def sync_calendar(db, year: int, client=None):
@@ -184,11 +295,10 @@ def sync_calendar(db, year: int, client=None):
                     if row and not row.sync_enabled:
                         result["editor_owned"] += 1
                         continue
-                    payload = parse_event(
-                        fetch_page(client, url), url, year, now
-                    )
+                    event_html = fetch_page(client, url)
+                    payload = parse_event(event_html, url, year, now)
+                    ensure_calendar_sessions(db, payload, event_html, row)
                     if row:
-                        payload.meeting_id = row.meeting_id
                         current = {
                             k: v
                             for k, v in row.schedule.items()
@@ -199,6 +309,18 @@ def sync_calendar(db, year: int, client=None):
                         )
                         if current == incoming:
                             result["unchanged"] += 1
+                            # A successful check refreshes provenance without
+                            # creating a spurious schedule revision/version.
+                            db.execute(update(CalendarWeekend).where(
+                                CalendarWeekend.id == row.id,
+                                CalendarWeekend.version == row.version,
+                                CalendarWeekend.sync_enabled.is_(True),
+                            ).values(schedule=payload.model_dump(mode="json")),
+                                execution_options={
+                                    "synchronize_session": False,
+                                })
+                            db.commit()
+                            db.expire(row)
                             continue
                     CalendarService(db).save(
                         payload,

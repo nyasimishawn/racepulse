@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 
 from fastapi import FastAPI
@@ -13,6 +14,9 @@ from app.core.redis import (
     create_redis_client,
     ensure_redis_available,
 )
+
+
+from app.workers.live_calendar_scheduler import run_live_calendar_scheduler
 
 
 configure_logging()
@@ -37,9 +41,19 @@ async def lifespan(app: FastAPI):
         settings.environment,
     )
 
-    yield
-
-    await redis.aclose()
+    calendar_stop = asyncio.Event()
+    calendar_task = (
+        asyncio.create_task(run_live_calendar_scheduler(calendar_stop))
+        if settings.calendar_sync_enabled
+        else None
+    )
+    try:
+        yield
+    finally:
+        calendar_stop.set()
+        if calendar_task is not None:
+            await calendar_task
+        await redis.aclose()
 
     logger.info("%s is shutting down", settings.app_name)
 

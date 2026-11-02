@@ -276,6 +276,11 @@ class FantasyRaceSummaryResponse(BaseModel):
     year: int
     session_name: str
     started_at: datetime | None
+    is_current: bool = False
+    is_replay: bool = False
+    source: str = ""
+    calendar_weekend_id: UUID | None = None
+    round_number: int | None = None
 
 
 class FantasyPredictionResponse(BaseModel):

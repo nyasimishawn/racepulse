@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,9 +11,7 @@ class Settings(BaseSettings):
     debug: bool = False
     api_v1_prefix: str = "/api/v1"
 
-    cors_allowed_origin_regex: str = (
-        r"^http://(localhost|127\.0\.0\.1):\d+$"
-    )
+    cors_allowed_origin_regex: str = r"^http://(localhost|127\.0\.0\.1):\d+$"
 
     database_url: str = (
         "postgresql+psycopg://racepulse:racepulse@localhost:5432/racepulse"
@@ -20,6 +19,26 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     fastf1_cache_path: str = "data/fastf1-cache"
     fastf1_verify_ssl: bool = True
+
+    # One backend collector checks the approved publisher feeds for all users.
+    news_sync_enabled: bool = True
+
+    # Refresh the published weekend and Fantasy in normal PyCharm API runs.
+    calendar_sync_enabled: bool = True
+    calendar_sync_interval_seconds: int = Field(default=900, ge=300)
+
+    # Live credentials belong only in the backend environment.
+    openf1_live_enabled: bool = False
+    openf1_username: str = ""
+    openf1_password: SecretStr = SecretStr("")
+
+    @property
+    def openf1_live_configured(self) -> bool:
+        return (
+            self.openf1_live_enabled
+            and bool(self.openf1_username)
+            and bool(self.openf1_password.get_secret_value())
+        )
 
     keycloak_enabled: bool = False
     keycloak_issuer_url: str = ""
@@ -75,9 +94,8 @@ class Settings(BaseSettings):
 
     @property
     def keycloak_swagger_configured(self) -> bool:
-        return (
-            self.keycloak_configured
-            and bool(self.keycloak_swagger_client_id)
+        return self.keycloak_configured and bool(
+            self.keycloak_swagger_client_id
         )
 
     @property

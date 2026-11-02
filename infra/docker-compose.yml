@@ -14,6 +14,12 @@ x-racepulse-app: &racepulse-app
     REDIS_URL: redis://redis:6379/0
     FASTF1_CACHE_PATH: /var/lib/racepulse/fastf1-cache
     FASTF1_VERIFY_SSL: ${FASTF1_VERIFY_SSL:-true}
+    NEWS_SYNC_ENABLED: ${NEWS_SYNC_ENABLED:-true}
+    CALENDAR_SYNC_ENABLED: ${CALENDAR_SYNC_ENABLED:-true}
+    CALENDAR_SYNC_INTERVAL_SECONDS: ${CALENDAR_SYNC_INTERVAL_SECONDS:-900}
+    OPENF1_LIVE_ENABLED: ${OPENF1_LIVE_ENABLED:-false}
+    OPENF1_USERNAME: ${OPENF1_USERNAME:-}
+    OPENF1_PASSWORD: ${OPENF1_PASSWORD:-}
     KEYCLOAK_ENABLED: ${KEYCLOAK_ENABLED:-false}
     KEYCLOAK_GROUPS_CLAIM: ${KEYCLOAK_GROUPS_CLAIM:-groups}
     KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-}
@@ -50,6 +56,16 @@ x-racepulse-app: &racepulse-app
       condition: service_healthy
 
 services:
+  news-worker:
+    <<: *racepulse-app
+    restart: unless-stopped
+    command: [python, -m, app.workers.news_worker]
+
+  live-worker:
+    <<: *racepulse-app
+    restart: unless-stopped
+    command: [python, -m, app.workers.live_worker]
+
   calendar-sync:
     <<: *racepulse-app
     restart: unless-stopped
